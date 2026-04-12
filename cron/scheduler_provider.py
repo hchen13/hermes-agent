@@ -54,6 +54,7 @@ class CronScheduler(ABC):
         stop_event: threading.Event,
         *,
         adapters: Any = None,
+        account_adapters: Any = None,
         loop: Any = None,
         interval: int = 60,
     ) -> None:
@@ -82,7 +83,14 @@ class CronScheduler(ABC):
         Built-in: no-op (it re-reads jobs.json on every tick)."""
         return None
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        adapters: Any = None,
+        account_adapters: Any = None,
+        loop: Any = None,
+    ) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
 
@@ -102,7 +110,12 @@ class CronScheduler(ABC):
         job = get_job(job_id)
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        return run_one_job(job, adapters=adapters, loop=loop)
+        return run_one_job(
+            job,
+            adapters=adapters,
+            account_adapters=account_adapters,
+            loop=loop,
+        )
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):
@@ -163,7 +176,15 @@ class InProcessCronScheduler(CronScheduler):
     def name(self) -> str:
         return "builtin"
 
-    def start(self, stop_event, *, adapters=None, loop=None, interval=60):
+    def start(
+        self,
+        stop_event,
+        *,
+        adapters=None,
+        account_adapters=None,
+        loop=None,
+        interval=60,
+    ):
         import logging
         from cron.scheduler import tick as cron_tick
 
@@ -171,7 +192,13 @@ class InProcessCronScheduler(CronScheduler):
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
         while not stop_event.is_set():
             try:
-                cron_tick(verbose=False, adapters=adapters, loop=loop, sync=False)
+                cron_tick(
+                    verbose=False,
+                    adapters=adapters,
+                    account_adapters=account_adapters,
+                    loop=loop,
+                    sync=False,
+                )
             except Exception as e:
                 logger.debug("Cron tick error: %s", e)
             stop_event.wait(interval)

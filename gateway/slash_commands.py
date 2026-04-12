@@ -1835,15 +1835,64 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
-        from gateway.run import _home_target_env_var, _home_thread_env_var
+        from gateway.run import _hermes_home, _home_target_env_var, _home_thread_env_var
         source = event.source
         platform_name = source.platform.value if source.platform else "unknown"
         chat_id = source.chat_id
         chat_name = source.chat_name or chat_id
 
+        thread_id = source.thread_id
+
+        # Multi-account Feishu persists the selected account with the home
+        # channel so cron and cross-platform delivery route to the same app.
+        if source.platform == Platform.FEISHU:
+            try:
+                import yaml
+
+                config_path = _hermes_home / "config.yaml"
+                user_config = {}
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = yaml.safe_load(f) or {}
+                platforms_cfg = user_config.setdefault("platforms", {})
+                if not isinstance(platforms_cfg, dict):
+                    platforms_cfg = {}
+                    user_config["platforms"] = platforms_cfg
+                feishu_cfg = platforms_cfg.setdefault("feishu", {})
+                if not isinstance(feishu_cfg, dict):
+                    feishu_cfg = {}
+                    platforms_cfg["feishu"] = feishu_cfg
+                feishu_cfg["home_channel"] = {
+                    "account_id": source.account_id,
+                    "chat_id": chat_id,
+                    "name": chat_name,
+                }
+                accounts_cfg = feishu_cfg.get("accounts", {})
+                if isinstance(accounts_cfg, dict):
+                    for account_cfg in accounts_cfg.values():
+                        if isinstance(account_cfg, dict):
+                            account_cfg.pop("home_channel", None)
+                if getattr(self, "config", None):
+                    base_platform_cfg = self.config.platforms.get(source.platform)
+                    if base_platform_cfg is not None:
+                        base_platform_cfg.home_channel = HomeChannel(
+                            platform=source.platform,
+                            chat_id=chat_id,
+                            name=chat_name,
+                            account_id=source.account_id,
+                        )
+                        raw_accounts = base_platform_cfg.extra.get("accounts", {})
+                        if isinstance(raw_accounts, dict):
+                            for raw_account_cfg in raw_accounts.values():
+                                if isinstance(raw_account_cfg, dict):
+                                    raw_account_cfg.pop("home_channel", None)
+                atomic_yaml_write(config_path, user_config)
+            except Exception as e:
+                return t("gateway.set_home.save_failed", error=e)
+            return t("gateway.set_home.success", name=chat_name, chat_id=chat_id)
+
         env_key = _home_target_env_var(platform_name)
         thread_env_key = _home_thread_env_var(platform_name)
-        thread_id = source.thread_id
 
         # Save to .env so it persists across restarts
         try:

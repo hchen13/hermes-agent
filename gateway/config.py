@@ -251,7 +251,8 @@ class HomeChannel:
     chat_id: str
     name: str  # Human-readable name for display
     thread_id: Optional[str] = None
-    
+    account_id: Optional[str] = None
+
     def to_dict(self) -> Dict[str, Any]:
         result = {
             "platform": self.platform.value,
@@ -260,8 +261,10 @@ class HomeChannel:
         }
         if self.thread_id:
             result["thread_id"] = self.thread_id
+        if self.account_id:
+            result["account_id"] = self.account_id
         return result
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "HomeChannel":
         return cls(
@@ -269,6 +272,7 @@ class HomeChannel:
             chat_id=str(data["chat_id"]),
             name=data.get("name", "Home"),
             thread_id=str(data["thread_id"]) if data.get("thread_id") else None,
+            account_id=str(data["account_id"]).strip() if data.get("account_id") else None,
         )
 
 
@@ -360,13 +364,35 @@ class PlatformConfig:
         if "home_channel" in data:
             home_channel = HomeChannel.from_dict(data["home_channel"])
 
+        # Preserve unknown top-level keys inside ``extra`` so platform-specific
+        # schemas can evolve (e.g. multi-account ``accounts:`` blocks) without
+        # forcing a core dataclass change first.
+        extra = data.get("extra", {})
+        if not isinstance(extra, dict):
+            extra = {}
+        extra = dict(extra)
+        _known_keys = {
+            "enabled",
+            "token",
+            "api_key",
+            "home_channel",
+            "reply_to_mode",
+            "gateway_restart_notification",
+            "extra",
+        }
+        for key, value in data.items():
+            if key in _known_keys:
+                continue
+            extra[key] = value
+
         # gateway_restart_notification may be bridged into extra via the
         # shared-key loop in load_gateway_config(); check both top-level
         # and extra so YAML ``discord: gateway_restart_notification: false``
         # works without needing a separate platforms: block.
         _grn = data.get("gateway_restart_notification")
         if _grn is None:
-            _grn = data.get("extra", {}).get("gateway_restart_notification")
+            _grn = extra.get("gateway_restart_notification")
+
 
         return cls(
             enabled=_coerce_bool(data.get("enabled"), False),
@@ -375,7 +401,7 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
-            extra=data.get("extra", {}),
+            extra=extra,
         )
 
 
@@ -475,7 +501,13 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.MSGRAPH_WEBHOOK: lambda cfg: bool(
         str(cfg.extra.get("client_state") or "").strip()
     ),
-    Platform.FEISHU: lambda cfg: bool(cfg.extra.get("app_id")),
+    Platform.FEISHU: lambda cfg: bool(
+        cfg.extra.get("app_id")
+        or any(
+            isinstance(account_cfg, dict) and account_cfg.get("app_id")
+            for account_cfg in (cfg.extra.get("accounts", {}) or {}).values()
+        )
+    ),
     Platform.WECOM: lambda cfg: bool(cfg.extra.get("bot_id")),
     Platform.WECOM_CALLBACK: lambda cfg: bool(
         cfg.extra.get("corp_id") or cfg.extra.get("apps")
@@ -569,7 +601,13 @@ class GatewayConfig:
         """Return list of platforms that are enabled and configured."""
         connected = []
         for platform, config in self.platforms.items():
-            if not config.enabled:
+            has_feishu_accounts = (
+                platform == Platform.FEISHU
+                and isinstance(config.extra, dict)
+                and isinstance(config.extra.get("accounts", {}), dict)
+                and bool(config.extra.get("accounts"))
+            )
+            if not config.enabled and not has_feishu_accounts:
                 continue
             if self._is_platform_connected(platform, config):
                 connected.append(platform)
@@ -609,11 +647,129 @@ class GatewayConfig:
 
         return False
     
-    def get_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
+    def get_default_account_id(self, platform: Platform) -> Optional[str]:
+        """Return the configured default account ID for a multi-account platform."""
+        config = self.platforms.get(platform)
+        if not config:
+            return None
+        if config.home_channel and getattr(config.home_channel, "account_id", None):
+            return str(config.home_channel.account_id).strip() or None
+        if not isinstance(config.extra, dict):
+            return None
+        value = str(config.extra.get("default_account") or "").strip()
+        return value or None
+
+    def get_platform_config(
+        self,
+        platform: Platform,
+        account_id: Optional[str] = None,
+    ) -> Optional[PlatformConfig]:
+        """Return the effective platform config for a platform/account pair."""
+        config = self.platforms.get(platform)
+        if not config:
+            return None
+        if platform != Platform.FEISHU:
+            return config
+
+        accounts = self.iter_platform_account_configs(platform)
+        if not accounts:
+            return config
+
+        resolved_account_id = (account_id or self.get_default_account_id(platform) or "").strip()
+        if resolved_account_id and resolved_account_id in accounts:
+            return accounts[resolved_account_id]
+
+        if config.home_channel or config.extra.get("app_id"):
+            return config
+
+        return next(iter(accounts.values()), config)
+
+    def iter_platform_account_configs(self, platform: Platform) -> Dict[str, PlatformConfig]:
+        """Return per-account platform configs for multi-account platforms."""
+        config = self.platforms.get(platform)
+        if not config or platform != Platform.FEISHU:
+            return {}
+
+        raw_accounts = config.extra.get("accounts", {})
+        if not isinstance(raw_accounts, dict) or not raw_accounts:
+            return {}
+
+        accounts: Dict[str, PlatformConfig] = {}
+        for account_id, account_block in raw_accounts.items():
+            normalized_id = str(account_id or "").strip()
+            if not normalized_id or not isinstance(account_block, dict):
+                continue
+            accounts[normalized_id] = _merge_account_platform_config(
+                platform=platform,
+                base_config=config,
+                account_id=normalized_id,
+                account_block=account_block,
+            )
+        return accounts
+
+    def iter_enabled_platform_bindings(self) -> List[tuple[Platform, Optional[str], PlatformConfig]]:
+        """Expand configured platforms into concrete adapter bindings."""
+        bindings: List[tuple[Platform, Optional[str], PlatformConfig]] = []
+        for platform, config in self.platforms.items():
+            account_configs = self.iter_platform_account_configs(platform)
+            if not config.enabled and not account_configs:
+                continue
+            if account_configs:
+                for account_id, account_config in account_configs.items():
+                    if account_config.enabled:
+                        bindings.append((platform, account_id, account_config))
+                continue
+            bindings.append((platform, None, config))
+        return bindings
+
+    def get_home_channel(self, platform: Platform, account_id: Optional[str] = None) -> Optional[HomeChannel]:
         """Get the home channel for a platform."""
         config = self.platforms.get(platform)
-        if config:
+        if not config:
+            return None
+        if platform != Platform.FEISHU:
             return config.home_channel
+
+        if config.home_channel:
+            home = config.home_channel
+            if home.account_id:
+                return home
+            resolved_account_id = account_id or self.get_default_account_id(platform)
+            if not resolved_account_id:
+                account_configs = self.iter_platform_account_configs(platform)
+                if len(account_configs) == 1:
+                    resolved_account_id = next(iter(account_configs.keys()))
+            if resolved_account_id:
+                return HomeChannel(
+                    platform=home.platform,
+                    chat_id=home.chat_id,
+                    name=home.name,
+                    account_id=resolved_account_id,
+                )
+            return home
+
+        account_configs = self.iter_platform_account_configs(platform)
+        if account_id:
+            account_config = account_configs.get(str(account_id).strip())
+            if account_config and account_config.home_channel:
+                return account_config.home_channel
+
+        if not account_configs:
+            return None
+
+        legacy_homes: Dict[str, HomeChannel] = {}
+        for legacy_account_id, account_config in account_configs.items():
+            home = account_config.home_channel
+            if not home or not getattr(home, "chat_id", None):
+                continue
+            legacy_homes[legacy_account_id] = home
+
+        if len(legacy_homes) == 1:
+            return next(iter(legacy_homes.values()))
+
+        default_account_id = self.get_default_account_id(platform)
+        if default_account_id and default_account_id in legacy_homes:
+            return legacy_homes[default_account_id]
         return None
     
     def get_reset_policy(
@@ -669,7 +825,14 @@ class GatewayConfig:
         for platform_name, platform_data in data.get("platforms", {}).items():
             try:
                 platform = Platform(platform_name)
-                platforms[platform] = PlatformConfig.from_dict(platform_data)
+                normalized_platform_data = dict(platform_data)
+                raw_home = normalized_platform_data.get("home_channel")
+                if isinstance(raw_home, dict) and "platform" not in raw_home:
+                    normalized_platform_data["home_channel"] = {
+                        **raw_home,
+                        "platform": platform.value,
+                    }
+                platforms[platform] = PlatformConfig.from_dict(normalized_platform_data)
             except ValueError:
                 pass  # Skip unknown platforms
         
@@ -752,9 +915,27 @@ class GatewayConfig:
             session_store_max_age_days=session_store_max_age_days,
         )
 
-    def get_unauthorized_dm_behavior(self, platform: Optional[Platform] = None) -> str:
+    def get_unauthorized_dm_behavior(
+        self,
+        platform: Optional[Platform] = None,
+        account_id: Optional[str] = None,
+    ) -> str:
         """Return the effective unauthorized-DM behavior for a platform."""
         if platform:
+            if account_id:
+                account_cfg = self.get_platform_config(platform, account_id=account_id)
+                if account_cfg:
+                    extra = account_cfg.extra if isinstance(account_cfg.extra, dict) else {}
+                    if "unauthorized_dm_behavior" in extra:
+                        return _normalize_unauthorized_dm_behavior(
+                            extra.get("unauthorized_dm_behavior"),
+                            self.unauthorized_dm_behavior,
+                        )
+                    dm_policy = str(extra.get("dm_policy", "") or "").strip().lower()
+                    if dm_policy == "pairing":
+                        return "pair"
+                    if dm_policy in {"allowlist", "disabled"}:
+                        return "ignore"
             platform_cfg = self.platforms.get(platform)
             if platform_cfg and "unauthorized_dm_behavior" in platform_cfg.extra:
                 return _normalize_unauthorized_dm_behavior(
@@ -773,6 +954,68 @@ class GatewayConfig:
                     "public",
                 )
         return "public"
+
+
+def _coerce_home_channel(
+    platform: Platform,
+    raw_home: Any,
+    *,
+    account_id: Optional[str] = None,
+) -> Optional[HomeChannel]:
+    """Build a HomeChannel from a dict that may omit the platform field."""
+    if not isinstance(raw_home, dict):
+        return None
+    payload = dict(raw_home)
+    platform_value = payload.get("platform")
+    if platform_value is None:
+        payload["platform"] = platform.value
+    if account_id and not payload.get("account_id"):
+        payload["account_id"] = account_id
+    if platform_value is None:
+        return HomeChannel.from_dict(payload)
+    return HomeChannel.from_dict(payload)
+
+
+def _merge_account_platform_config(
+    *,
+    platform: Platform,
+    base_config: PlatformConfig,
+    account_id: str,
+    account_block: Dict[str, Any],
+) -> PlatformConfig:
+    """Overlay an account block onto a base platform config."""
+    base_extra = dict(base_config.extra or {})
+    base_extra.pop("accounts", None)
+    base_extra.pop("default_account", None)
+
+    account_extra = account_block.get("extra", {})
+    if not isinstance(account_extra, dict):
+        account_extra = {}
+    account_extra = dict(account_extra)
+    for key, value in account_block.items():
+        if key in {"enabled", "token", "api_key", "home_channel", "reply_to_mode", "extra"}:
+            continue
+        account_extra[key] = value
+
+    merged_extra = {**base_extra, **account_extra}
+    merged_extra["account_id"] = account_id
+
+    home_channel = None
+    if isinstance(account_block.get("home_channel"), dict):
+        home_channel = _coerce_home_channel(
+            platform,
+            account_block.get("home_channel"),
+            account_id=account_id,
+        )
+
+    return PlatformConfig(
+        enabled=_coerce_bool(account_block.get("enabled"), base_config.enabled or True),
+        token=account_block.get("token", base_config.token),
+        api_key=account_block.get("api_key", base_config.api_key),
+        home_channel=home_channel,
+        reply_to_mode=account_block.get("reply_to_mode", base_config.reply_to_mode),
+        extra=merged_extra,
+    )
 
 
 def load_gateway_config() -> GatewayConfig:
@@ -1796,9 +2039,14 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             )
 
     # Feishu / Lark
+    feishu_has_accounts = bool(
+        config.platforms.get(Platform.FEISHU)
+        and isinstance(config.platforms[Platform.FEISHU].extra, dict)
+        and config.platforms[Platform.FEISHU].extra.get("accounts")
+    )
     feishu_app_id = os.getenv("FEISHU_APP_ID")
     feishu_app_secret = os.getenv("FEISHU_APP_SECRET")
-    if feishu_app_id and feishu_app_secret:
+    if feishu_app_id and feishu_app_secret and not feishu_has_accounts:
         if Platform.FEISHU not in config.platforms:
             config.platforms[Platform.FEISHU] = PlatformConfig()
         config.platforms[Platform.FEISHU].enabled = True
@@ -1814,14 +2062,33 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         feishu_verification_token = os.getenv("FEISHU_VERIFICATION_TOKEN", "")
         if feishu_verification_token:
             config.platforms[Platform.FEISHU].extra["verification_token"] = feishu_verification_token
-        feishu_home = os.getenv("FEISHU_HOME_CHANNEL")
-        if feishu_home:
-            config.platforms[Platform.FEISHU].home_channel = HomeChannel(
-                platform=Platform.FEISHU,
-                chat_id=feishu_home,
-                name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
-                thread_id=os.getenv("FEISHU_HOME_CHANNEL_THREAD_ID") or None,
-            )
+
+    # FEISHU_HOME_CHANNEL is honoured for both single-account (handled
+    # above) and multi-account-only configurations.  When the platform
+    # is configured purely via ``accounts:`` (no top-level app_id), we
+    # still want the home channel applied with the appropriate
+    # ``account_id`` so cron and tool deliveries route correctly.
+    feishu_home = os.getenv("FEISHU_HOME_CHANNEL")
+    if feishu_home and Platform.FEISHU in config.platforms:
+        feishu_home_account_id = None
+        try:
+            feishu_home_account_id = config.get_default_account_id(Platform.FEISHU)
+        except AttributeError:
+            feishu_home_account_id = None
+        if not feishu_home_account_id:
+            try:
+                feishu_accounts = config.iter_platform_account_configs(Platform.FEISHU)
+            except AttributeError:
+                feishu_accounts = {}
+            if len(feishu_accounts) == 1:
+                feishu_home_account_id = next(iter(feishu_accounts.keys()))
+        config.platforms[Platform.FEISHU].home_channel = HomeChannel(
+            platform=Platform.FEISHU,
+            chat_id=feishu_home,
+            name=os.getenv("FEISHU_HOME_CHANNEL_NAME", "Home"),
+            thread_id=os.getenv("FEISHU_HOME_CHANNEL_THREAD_ID") or None,
+            account_id=feishu_home_account_id,
+        )
 
     # WeCom (Enterprise WeChat)
     wecom_bot_id = os.getenv("WECOM_BOT_ID")

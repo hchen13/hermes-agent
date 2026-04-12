@@ -777,6 +777,51 @@ class TestAdapterBehavior(unittest.TestCase):
         message_with_mention = SimpleNamespace(mentions=[SimpleNamespace(key="@_user_1")])
         self.assertFalse(_admits_group(adapter, message_with_mention, sender_id, ""))
 
+    def test_group_message_can_disable_require_mention_at_account_level(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"group_policy": "open", "require_mention": False})
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+
+        self.assertTrue(adapter._should_accept_group_message(SimpleNamespace(mentions=[]), sender_id, ""))
+
+    def test_group_rule_can_override_require_mention(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "group_policy": "open",
+                    "require_mention": False,
+                    "group_rules": {
+                        "oc_strict": {
+                            "policy": "open",
+                            "require_mention": True,
+                        }
+                    },
+                }
+            )
+        )
+        adapter._bot_open_id = "ou_bot"
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        bot_mention = SimpleNamespace(
+            name="Bot",
+            id=SimpleNamespace(open_id="ou_bot", user_id=None),
+        )
+
+        self.assertFalse(adapter._should_accept_group_message(SimpleNamespace(mentions=[]), sender_id, "oc_strict"))
+        self.assertTrue(
+            adapter._should_accept_group_message(
+                SimpleNamespace(mentions=[bot_mention]),
+                sender_id,
+                "oc_strict",
+            )
+        )
+
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_with_other_user_mention_is_rejected_when_bot_identity_unknown(self):
         from gateway.config import PlatformConfig
@@ -1030,6 +1075,65 @@ class TestAdapterBehavior(unittest.TestCase):
             )
         )
 
+    @patch.dict(os.environ, {"FEISHU_BOT_NAME": "Legacy Bot"}, clear=True)
+    def test_account_scoped_adapter_ignores_legacy_bot_name_env(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "account_id": "corp_a",
+                    "app_id": "cli_corp_a",
+                    "app_secret": "sec_corp_a",
+                    "group_policy": "open",
+                }
+            )
+        )
+
+        self.assertEqual(adapter._bot_name, "")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_adapter_ignores_bot_name_in_config(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "cli_demo",
+                    "app_secret": "sec_demo",
+                    "bot_name": "Config Bot",
+                }
+            )
+        )
+
+        self.assertEqual(adapter._bot_name, "")
+
+    @patch.dict(
+        os.environ,
+        {
+            "FEISHU_APP_ID_FROM_ENV": "cli_env",
+            "FEISHU_APP_SECRET_FROM_ENV": "sec_env",
+        },
+        clear=True,
+    )
+    def test_adapter_resolves_env_references_for_credentials(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "app_id": "env:FEISHU_APP_ID_FROM_ENV",
+                    "app_secret": "env:FEISHU_APP_SECRET_FROM_ENV",
+                }
+            )
+        )
+
+        self.assertEqual(adapter._app_id, "cli_env")
+        self.assertEqual(adapter._app_secret, "sec_env")
+
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_matches_bot_open_id_when_configured(self):
         from gateway.config import PlatformConfig
@@ -1111,6 +1215,134 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(
             _admits_group(adapter2, SimpleNamespace(mentions=[bot_mention]), sender_id, "")
         )
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_group_message_does_not_fallback_to_name_when_payload_has_different_id(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._bot_name = "Hermes Bot"
+        adapter._bot_open_id = "ou_bot"
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+
+        conflicting_mention = SimpleNamespace(
+            name="Hermes Bot",
+            id=SimpleNamespace(open_id="ou_other", user_id="u_other"),
+        )
+
+        self.assertFalse(
+            _admits_group(
+                adapter,
+                SimpleNamespace(mentions=[conflicting_mention]),
+                sender_id,
+                "",
+            )
+        )
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_hydrate_bot_identity_prefers_bot_info_endpoint(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            request=Mock(
+                return_value=SimpleNamespace(
+                    success=lambda: True,
+                    raw=SimpleNamespace(
+                        content=b'{"code":0,"msg":"success","bot":{"open_id":"ou_bot","bot_name":"Hermes Bot"}}'
+                    ),
+                )
+            ),
+            application=SimpleNamespace(
+                v6=SimpleNamespace(
+                    application=SimpleNamespace(get=Mock())
+                )
+            ),
+        )
+
+        asyncio.run(adapter._hydrate_bot_identity())
+
+        self.assertEqual(adapter._bot_open_id, "ou_bot")
+        self.assertEqual(adapter._bot_name, "Hermes Bot")
+        adapter._client.application.v6.application.get.assert_not_called()
+
+    @patch.dict(
+        os.environ,
+        {
+            "FEISHU_GROUP_POLICY": "open",
+            "FEISHU_BOT_NAME": "Legacy Bot",
+        },
+        clear=True,
+    )
+    def test_hydrate_bot_identity_does_not_short_circuit_on_legacy_bot_name_env(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            request=Mock(
+                return_value=SimpleNamespace(
+                    success=lambda: True,
+                    raw=SimpleNamespace(
+                        content=b'{"code":0,"msg":"success","bot":{"open_id":"ou_bot","bot_name":"Official Bot"}}'
+                    ),
+                )
+            ),
+            application=SimpleNamespace(
+                v6=SimpleNamespace(
+                    application=SimpleNamespace(get=Mock())
+                )
+            ),
+        )
+
+        asyncio.run(adapter._hydrate_bot_identity())
+
+        self.assertEqual(adapter._bot_open_id, "ou_bot")
+        self.assertEqual(adapter._bot_name, "Official Bot")
+        adapter._client.request.assert_called_once()
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_hydrate_bot_identity_falls_back_to_application_info(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            request=Mock(
+                return_value=SimpleNamespace(
+                    success=lambda: False,
+                    code=9999,
+                    msg="not available",
+                )
+            ),
+            application=SimpleNamespace(
+                v6=SimpleNamespace(
+                    application=SimpleNamespace(
+                        get=Mock(
+                            return_value=SimpleNamespace(
+                                success=lambda: True,
+                                data=SimpleNamespace(
+                                    app=SimpleNamespace(app_name="Fallback App")
+                                ),
+                            )
+                        )
+                    )
+                )
+            ),
+        )
+
+        asyncio.run(adapter._hydrate_bot_identity())
+
+        self.assertFalse(adapter._bot_open_id)
+        self.assertEqual(adapter._bot_name, "Fallback App")
+
+    # TODO(runtime-sync): 4dccd1f75 included a
+    # ``test_group_post_message_uses_parsed_mentions_when_sdk_mentions_missing``
+    # test; the conflict truncated its body before merge. The behavior is
+    # covered by other group-admit tests above — re-add the dedicated test
+    # if/when the bot-parsed-mentions fallback regresses.
 
     @patch.dict(os.environ, {}, clear=True)
     def test_extract_post_message_as_text(self):

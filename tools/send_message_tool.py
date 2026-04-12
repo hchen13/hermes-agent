@@ -288,6 +288,45 @@ def _handle_react(args, remove=False):
     return json.dumps({"success": bool(result)})
 
 
+def _get_config_callable(config, name):
+    """Return a real config helper method, ignoring MagicMock auto-attributes."""
+    try:
+        instance_attr = vars(config).get(name)
+    except Exception:
+        instance_attr = None
+    if callable(instance_attr):
+        return instance_attr
+
+    class_attr = getattr(type(config), name, None)
+    if callable(class_attr):
+        return getattr(config, name)
+    return None
+
+
+def _resolve_platform_config(config, platform, account_id=None):
+    """Support both GatewayConfig and lightweight test doubles."""
+    getter = _get_config_callable(config, "get_platform_config")
+    if getter:
+        try:
+            return getter(platform, account_id=account_id)
+        except TypeError:
+            return getter(platform)
+
+    platforms = getattr(config, "platforms", {}) or {}
+    return platforms.get(platform)
+
+
+def _resolve_home_channel(config, platform, account_id=None):
+    """Support both GatewayConfig and lightweight test doubles."""
+    getter = _get_config_callable(config, "get_home_channel")
+    if getter:
+        try:
+            return getter(platform, account_id=account_id)
+        except TypeError:
+            return getter(platform)
+    return None
+
+
 def _handle_send(args):
     """Send a message to a platform target."""
     target = args.get("target", "")
@@ -341,7 +380,45 @@ def _handle_send(args):
     except (ValueError, KeyError):
         return tool_error(f"Unknown platform: {platform_name}")
 
-    pconfig = config.platforms.get(platform)
+    from gateway.session_context import get_session_env
+
+    session_platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    session_account_id = get_session_env("HERMES_SESSION_ACCOUNT_ID", "")
+    effective_account_id = session_account_id if session_platform == platform_name else ""
+    delivery_account_id = effective_account_id or None
+
+    from gateway.platforms.base import BasePlatformAdapter
+
+    # Capture [[as_document]] directive before extract_media strips it.
+    # Image-extension files in this batch will route through send_document
+    # instead of send_photo so the original bytes survive (e.g. info-graph
+    # JPGs where Telegram's sendPhoto recompresses to 1280px).
+    force_document_attachments = "[[as_document]]" in message
+
+    media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
+    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
+
+    used_home_channel = False
+    if not chat_id:
+        home = _resolve_home_channel(config, platform, account_id=effective_account_id or None)
+        if not home and platform_name == "weixin":
+            wx_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
+            if wx_home:
+                from gateway.config import HomeChannel
+                home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
+        if home:
+            chat_id = home.chat_id
+            delivery_account_id = getattr(home, "account_id", None) or delivery_account_id
+            used_home_channel = True
+        else:
+            return json.dumps({
+                "error": f"No home channel set for {platform_name} to determine where to send the message. "
+                f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
+                f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
+            })
+
+    pconfig = _resolve_platform_config(config, platform, account_id=delivery_account_id)
     if not pconfig or not pconfig.enabled:
         # Weixin can be configured purely via .env; synthesize a pconfig so
         # send_message and cron delivery work without a gateway.yaml entry.
@@ -364,40 +441,12 @@ def _handle_send(args):
         else:
             return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
-    from gateway.platforms.base import BasePlatformAdapter
-
-    # Capture [[as_document]] directive before extract_media strips it.
-    # Image-extension files in this batch will route through send_document
-    # instead of send_photo so the original bytes survive (e.g. info-graph
-    # JPGs where Telegram's sendPhoto recompresses to 1280px).
-    force_document_attachments = "[[as_document]]" in message
-
-    media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
-    media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-    mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
-
-    used_home_channel = False
-    if not chat_id:
-        home = config.get_home_channel(platform)
-        if not home and platform_name == "weixin":
-            wx_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
-            if wx_home:
-                from gateway.config import HomeChannel
-                home = HomeChannel(platform=platform, chat_id=wx_home, name="Weixin Home")
-        if home:
-            chat_id = home.chat_id
-            used_home_channel = True
-        else:
-            home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
-                platform_name, f"{platform_name.upper()}_HOME_CHANNEL"
-            )
-            return json.dumps({
-                "error": f"No home channel set for {platform_name} to determine where to send the message. "
-                f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
-                f"or set a home channel via: hermes config set {home_env} <channel_id>"
-            })
-
-    duplicate_skip = _maybe_skip_cron_duplicate_send(platform_name, chat_id, thread_id)
+    duplicate_skip = _maybe_skip_cron_duplicate_send(
+        platform_name,
+        chat_id,
+        thread_id,
+        account_id=delivery_account_id,
+    )
     if duplicate_skip:
         return json.dumps(duplicate_skip)
 
@@ -443,7 +492,6 @@ def _handle_send(args):
         if isinstance(result, dict) and result.get("success") and mirror_text:
             try:
                 from gateway.mirror import mirror_to_session
-                from gateway.session_context import get_session_env
                 source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli")
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
                 if mirror_to_session(
@@ -567,14 +615,21 @@ def _get_cron_auto_delivery_target():
     if not platform or not chat_id:
         return None
     thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
+    account_id = get_session_env("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID", "").strip() or None
     return {
         "platform": platform,
         "chat_id": chat_id,
         "thread_id": thread_id,
+        "account_id": account_id,
     }
 
 
-def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id: str | None):
+def _maybe_skip_cron_duplicate_send(
+    platform_name: str,
+    chat_id: str,
+    thread_id: str | None,
+    account_id: str | None = None,
+):
     """Skip redundant cron send_message calls when the scheduler will auto-deliver there."""
     auto_target = _get_cron_auto_delivery_target()
     if not auto_target:
@@ -584,6 +639,7 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
         auto_target["platform"] == platform_name
         and str(auto_target["chat_id"]) == str(chat_id)
         and auto_target.get("thread_id") == thread_id
+        and (auto_target.get("account_id") or None) == (account_id or None)
     )
     if not same_target:
         return None

@@ -79,6 +79,7 @@ class SessionSource:
     """
     platform: Platform
     chat_id: str
+    account_id: Optional[str] = None
     chat_name: Optional[str] = None
     chat_type: str = "dm"  # "dm", "group", "channel", "thread"
     user_id: Optional[str] = None
@@ -122,6 +123,7 @@ class SessionSource:
     def to_dict(self) -> Dict[str, Any]:
         d = {
             "platform": self.platform.value,
+            "account_id": self.account_id,
             "chat_id": self.chat_id,
             "chat_name": self.chat_name,
             "chat_type": self.chat_type,
@@ -148,6 +150,7 @@ class SessionSource:
     def from_dict(cls, data: Dict[str, Any]) -> "SessionSource":
         return cls(
             platform=Platform(data["platform"]),
+            account_id=data.get("account_id"),
             chat_id=str(data["chat_id"]),
             chat_name=data.get("chat_name"),
             chat_type=data.get("chat_type", "dm"),
@@ -679,6 +682,9 @@ def build_session_key(
     """
     ns = _session_key_namespace(profile)
     platform = source.platform.value
+    platform_scope = platform
+    if source.account_id:
+        platform_scope = f"{platform}[{source.account_id}]"
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
@@ -686,8 +692,8 @@ def build_session_key(
 
         if dm_chat_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_chat_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_chat_id}"
+                return f"{ns}:{platform_scope}:dm:{dm_chat_id}:{source.thread_id}"
+            return f"{ns}:{platform_scope}:dm:{dm_chat_id}"
         # No chat_id — fall back to the sender's own identifier before the
         # bare per-platform sink.  Without this, every DM from every user that
         # arrives without a chat_id (non-standard adapters / synthetic sources)
@@ -702,11 +708,11 @@ def build_session_key(
             )
         if dm_participant_id:
             if source.thread_id:
-                return f"{ns}:{platform}:dm:{dm_participant_id}:{source.thread_id}"
-            return f"{ns}:{platform}:dm:{dm_participant_id}"
+                return f"{ns}:{platform_scope}:dm:{dm_participant_id}:{source.thread_id}"
+            return f"{ns}:{platform_scope}:dm:{dm_participant_id}"
         if source.thread_id:
-            return f"{ns}:{platform}:dm:{source.thread_id}"
-        return f"{ns}:{platform}:dm"
+            return f"{ns}:{platform_scope}:dm:{source.thread_id}"
+        return f"{ns}:{platform_scope}:dm"
 
     participant_id = source.user_id_alt or source.user_id
     if participant_id and source.platform == Platform.WHATSAPP:
@@ -714,7 +720,7 @@ def build_session_key(
         # single group member gets two isolated per-user sessions when the
         # bridge reshuffles alias forms.
         participant_id = canonical_whatsapp_identifier(str(participant_id)) or participant_id
-    key_parts = [ns, platform, source.chat_type]
+    key_parts = [ns, platform_scope, source.chat_type]
 
     if source.chat_id:
         key_parts.append(source.chat_id)

@@ -18,7 +18,7 @@ import time -> no import cycle. The lazy import preserves the exact logger name
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from gateway.config import Platform
 from gateway.session import SessionSource
@@ -31,7 +31,29 @@ from gateway.whatsapp_identity import (
 class GatewayAuthorizationMixin:
     """User/chat authorization methods for ``GatewayRunner``."""
 
-    def _adapter_enforces_own_access_policy(self, platform: Optional[Platform]) -> bool:
+    def _adapter_for_auth(
+        self,
+        platform: Optional[Platform],
+        account_id: Optional[str] = None,
+    ):
+        """Return the live adapter for an auth decision, honoring account binding."""
+        if not platform:
+            return None
+        if account_id and hasattr(self, "_get_adapter"):
+            try:
+                adapter = self._get_adapter(platform, account_id)
+                if adapter is not None:
+                    return adapter
+            except Exception:
+                pass
+        adapters = getattr(self, "adapters", None) or {}
+        return adapters.get(platform)
+
+    def _adapter_enforces_own_access_policy(
+        self,
+        platform: Optional[Platform],
+        account_id: Optional[str] = None,
+    ) -> bool:
         """Whether the adapter for *platform* gates access at intake itself.
 
         Mirrors ``BasePlatformAdapter.enforces_own_access_policy``. Adapters
@@ -46,18 +68,16 @@ class GatewayAuthorizationMixin:
         """
         if not platform:
             return False
-        # Some test helpers build a bare GatewayRunner via object.__new__ and
-        # never set ``adapters``; treat a missing/empty map as "no adapter"
-        # rather than raising (see pitfalls.md #17).
-        adapters = getattr(self, "adapters", None)
-        if not adapters:
-            return False
-        adapter = adapters.get(platform)
+        adapter = self._adapter_for_auth(platform, account_id)
         if adapter is None:
             return False
         return bool(getattr(adapter, "enforces_own_access_policy", False))
 
-    def _adapter_dm_policy(self, platform: Optional[Platform]) -> str:
+    def _adapter_dm_policy(
+        self,
+        platform: Optional[Platform],
+        account_id: Optional[str] = None,
+    ) -> str:
         """Best-effort read of an own-policy adapter's effective DM policy.
 
         Returns the lowercased ``dm_policy`` (``"open"`` / ``"allowlist"`` /
@@ -75,22 +95,21 @@ class GatewayAuthorizationMixin:
         """
         if not platform:
             return ""
-        adapters = getattr(self, "adapters", None) or {}
-        adapter = adapters.get(platform)
+        adapter = self._adapter_for_auth(platform, account_id)
         policy = getattr(adapter, "_dm_policy", None) if adapter is not None else None
         if policy is None:
             config = getattr(self, "config", None)
-            platform_cfg = (
-                config.platforms.get(platform)
-                if config is not None and hasattr(config, "platforms")
-                else None
-            )
+            platform_cfg = self._account_platform_config(config, platform, account_id)
             extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
             if isinstance(extra, dict):
                 policy = extra.get("dm_policy")
         return str(policy or "").strip().lower()
 
-    def _adapter_group_policy(self, platform: Optional[Platform]) -> str:
+    def _adapter_group_policy(
+        self,
+        platform: Optional[Platform],
+        account_id: Optional[str] = None,
+    ) -> str:
         """Best-effort read of an own-policy adapter's effective group policy.
 
         Mirror of ``_adapter_dm_policy`` for group / forum / channel traffic:
@@ -106,16 +125,11 @@ class GatewayAuthorizationMixin:
         """
         if not platform:
             return ""
-        adapters = getattr(self, "adapters", None) or {}
-        adapter = adapters.get(platform)
+        adapter = self._adapter_for_auth(platform, account_id)
         policy = getattr(adapter, "_group_policy", None) if adapter is not None else None
         if policy is None:
             config = getattr(self, "config", None)
-            platform_cfg = (
-                config.platforms.get(platform)
-                if config is not None and hasattr(config, "platforms")
-                else None
-            )
+            platform_cfg = self._account_platform_config(config, platform, account_id)
             extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
             if isinstance(extra, dict):
                 policy = extra.get("group_policy")
@@ -125,6 +139,7 @@ class GatewayAuthorizationMixin:
         self,
         platform: Optional[Platform],
         chat_id: Optional[str],
+        account_id: Optional[str] = None,
     ) -> bool:
         """Whether a per-group sender allowlist gated this group message.
 
@@ -137,16 +152,11 @@ class GatewayAuthorizationMixin:
         """
         if not platform or not chat_id:
             return False
-        adapters = getattr(self, "adapters", None) or {}
-        adapter = adapters.get(platform)
+        adapter = self._adapter_for_auth(platform, account_id)
         groups = getattr(adapter, "_groups", None) if adapter is not None else None
         if groups is None:
             config = getattr(self, "config", None)
-            platform_cfg = (
-                config.platforms.get(platform)
-                if config is not None and hasattr(config, "platforms")
-                else None
-            )
+            platform_cfg = self._account_platform_config(config, platform, account_id)
             extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
             if isinstance(extra, dict):
                 groups = extra.get("groups")
@@ -172,6 +182,91 @@ class GatewayAuthorizationMixin:
         if isinstance(sender_allow, (list, tuple, set)):
             return any(str(item).strip() for item in sender_allow)
         return False
+
+    def _account_platform_config(
+        self,
+        config: Any,
+        platform: Optional[Platform],
+        account_id: Optional[str] = None,
+    ):
+        if not config or not platform:
+            return None
+        if account_id:
+            getter = getattr(config, "get_platform_config", None)
+            if callable(getter):
+                try:
+                    account_cfg = getter(platform, account_id=account_id)
+                except TypeError:
+                    account_cfg = None
+                if account_cfg is not None:
+                    return account_cfg
+        if hasattr(config, "platforms"):
+            return config.platforms.get(platform)
+        return None
+
+    @staticmethod
+    def _parse_authorized_id_list(raw_value: Any) -> set[str]:
+        """Normalize a config allowlist value into a set of IDs."""
+        if isinstance(raw_value, (list, tuple, set, frozenset)):
+            values = raw_value
+        else:
+            values = str(raw_value or "").split(",")
+        return {str(item).strip() for item in values if str(item).strip()}
+
+    def _get_account_scoped_authorization(self, source: SessionSource) -> Optional[bool]:
+        """Return account-scoped authorization for multi-account platforms, if configured."""
+        config = getattr(self, "config", None)
+        if not config or not source.platform or not source.account_id:
+            return None
+        platform_cfg = self._account_platform_config(config, source.platform, source.account_id)
+        if platform_cfg is None:
+            return None
+        extra = platform_cfg.extra if isinstance(platform_cfg.extra, dict) else {}
+
+        if source.platform == Platform.FEISHU:
+            if source.chat_type != "dm":
+                if any(
+                    key in extra
+                    for key in (
+                        "app_id",
+                        "group_policy",
+                        "default_group_policy",
+                        "group_rules",
+                        "require_mention",
+                        "allowed_group_users",
+                        "admins",
+                    )
+                ):
+                    return True
+                return None
+
+            dm_policy = str(extra.get("dm_policy", "") or "").strip().lower()
+            if str(extra.get("allow_all_users", "")).strip().lower() in {"true", "1", "yes"}:
+                return True
+            if dm_policy == "open":
+                return True
+            if dm_policy == "disabled":
+                return False
+
+            check_ids = {
+                str(value).strip()
+                for value in (source.user_id, source.user_id_alt)
+                if str(value or "").strip()
+            }
+            allowed_ids = self._parse_authorized_id_list(extra.get("allowed_users"))
+
+            if dm_policy == "allowlist":
+                if "*" in allowed_ids:
+                    return True
+                return bool(check_ids & allowed_ids)
+            if dm_policy == "pairing":
+                return None
+            if allowed_ids:
+                if "*" in allowed_ids:
+                    return True
+                return bool(check_ids & allowed_ids)
+
+        return None
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """
@@ -223,6 +318,10 @@ class GatewayAuthorizationMixin:
 
         if not user_id:
             return False
+
+        account_auth = self._get_account_scoped_authorization(source)
+        if account_auth is not None:
+            return account_auth
 
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",
@@ -346,16 +445,24 @@ class GatewayAuthorizationMixin:
             # flag (checked above), and the pairing flow remain the explicit
             # opt-ins to broader access. (#34515 follow-up: trusting "open" was a
             # fail-open.)
-            if self._adapter_enforces_own_access_policy(source.platform):
+            account_id = getattr(source, "account_id", None)
+            if self._adapter_enforces_own_access_policy(source.platform, account_id=account_id):
                 if source.chat_type in {"group", "forum", "channel"}:
-                    effective_policy = self._adapter_group_policy(source.platform)
+                    effective_policy = self._adapter_group_policy(
+                        source.platform,
+                        account_id=account_id,
+                    )
                     if self._adapter_group_has_sender_allowlist(
                         source.platform,
                         source.chat_id,
+                        account_id=account_id,
                     ):
                         return True
                 else:
-                    effective_policy = self._adapter_dm_policy(source.platform)
+                    effective_policy = self._adapter_dm_policy(
+                        source.platform,
+                        account_id=account_id,
+                    )
                 if effective_policy == "allowlist":
                     return True
             # No allowlists configured -- check global allow-all flag
@@ -452,7 +559,11 @@ class GatewayAuthorizationMixin:
 
         return bool(check_ids & allowed_ids)
 
-    def _get_unauthorized_dm_behavior(self, platform: Optional[Platform]) -> str:
+    def _get_unauthorized_dm_behavior(
+        self,
+        platform: Optional[Platform],
+        account_id: Optional[str] = None,
+    ) -> str:
         """Return how unauthorized DMs should be handled for a platform.
 
         Resolution order:
@@ -468,12 +579,20 @@ class GatewayAuthorizationMixin:
         """
         config = getattr(self, "config", None)
 
-        # Check for an explicit per-platform override first.
+        # Check for an explicit per-account / per-platform override first.
         if config and hasattr(config, "get_unauthorized_dm_behavior") and platform:
-            platform_cfg = config.platforms.get(platform) if hasattr(config, "platforms") else None
-            if platform_cfg and "unauthorized_dm_behavior" in getattr(platform_cfg, "extra", {}):
-                # Operator explicitly configured behavior for this platform — respect it.
-                return config.get_unauthorized_dm_behavior(platform)
+            platform_cfg = self._account_platform_config(config, platform, account_id)
+            extra = getattr(platform_cfg, "extra", {}) if platform_cfg else {}
+            has_account_override = bool(account_id)
+            has_platform_override = (
+                platform_cfg is not None
+                and "unauthorized_dm_behavior" in extra
+            )
+            if has_account_override or has_platform_override:
+                return config.get_unauthorized_dm_behavior(
+                    platform,
+                    account_id=account_id,
+                )
 
         # Check for an explicit global config override.
         if config and hasattr(config, "unauthorized_dm_behavior"):
@@ -485,7 +604,7 @@ class GatewayAuthorizationMixin:
         # so unauthorized DMs should be dropped silently rather than answered
         # with a pairing code. An explicit pairing policy opts back into codes.
         if platform and config and hasattr(config, "platforms"):
-            platform_cfg = config.platforms.get(platform)
+            platform_cfg = self._account_platform_config(config, platform, account_id)
             extra = getattr(platform_cfg, "extra", None) if platform_cfg else None
             if isinstance(extra, dict):
                 dm_policy = str(extra.get("dm_policy") or "").strip().lower()

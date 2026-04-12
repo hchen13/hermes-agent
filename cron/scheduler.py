@@ -488,26 +488,25 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
 
     if deliver_value == "origin":
         if origin:
-            return {
+            target = {
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
                 "thread_id": origin.get("thread_id"),
             }
+            if origin.get("account_id"):
+                target["account_id"] = origin.get("account_id")
+            return target
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
         for platform_name in _iter_home_target_platforms():
-            chat_id = _get_home_target_chat_id(platform_name)
-            if chat_id:
+            target = _resolve_home_delivery_target(platform_name, origin=None)
+            if target:
                 logger.info(
                     "Job '%s' has deliver=origin but no origin; falling back to %s home channel",
                     job.get("name", job.get("id", "?")),
                     platform_name,
                 )
-                return {
-                    "platform": platform_name,
-                    "chat_id": chat_id,
-                    "thread_id": _get_home_target_thread_id(platform_name),
-                }
+                return target
         return None
 
     if ":" in deliver_value:
@@ -537,31 +536,120 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
         except Exception:
             pass
 
-        return {
+        target = {
             "platform": platform_name,
             "chat_id": chat_id,
             "thread_id": thread_id,
         }
+        if origin and origin.get("platform") == platform_name and origin.get("account_id"):
+            target["account_id"] = origin.get("account_id")
+        return target
 
     platform_name = deliver_value
     if origin and origin.get("platform") == platform_name:
-        return {
+        target = {
             "platform": platform_name,
             "chat_id": str(origin["chat_id"]),
             "thread_id": origin.get("thread_id"),
         }
+        if origin.get("account_id"):
+            target["account_id"] = origin.get("account_id")
+        return target
 
     if not _is_known_delivery_platform(platform_name):
         return None
-    chat_id = _get_home_target_chat_id(platform_name)
-    if not chat_id:
-        return None
+    return _resolve_home_delivery_target(platform_name, origin=origin)
 
-    return {
-        "platform": platform_name,
-        "chat_id": chat_id,
-        "thread_id": _get_home_target_thread_id(platform_name),
-    }
+
+def _resolve_home_delivery_target(platform_name: str, origin: dict | None) -> Optional[dict]:
+    """Resolve a home-channel delivery target for ``platform_name``.
+
+    Honours per-platform env vars (built-in + plugin) and Telegram's optional
+    cron-thread override.  When the env var is not set, falls back to a
+    config-backed home channel resolution that is account-aware when the
+    triggering ``origin`` carried an ``account_id`` (multi-account routing).
+    """
+    chat_id = _get_home_target_chat_id(platform_name)
+    if chat_id:
+        return {
+            "platform": platform_name,
+            "chat_id": chat_id,
+            "thread_id": _get_home_target_thread_id(platform_name),
+        }
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        config = load_gateway_config()
+        platform_enum = Platform(platform_name.lower())
+        account_id = None
+        if origin and origin.get("platform") == platform_name and origin.get("account_id"):
+            account_id = origin.get("account_id")
+        home = _resolve_home_channel(config, platform_enum, account_id=account_id)
+        if home and getattr(home, "chat_id", None):
+            target = {
+                "platform": platform_name,
+                "chat_id": str(home.chat_id),
+                "thread_id": None,
+            }
+            resolved_account_id = getattr(home, "account_id", None) or account_id
+            if resolved_account_id:
+                target["account_id"] = resolved_account_id
+            return target
+    except Exception:
+        logger.debug("Failed to resolve config-backed home channel for deliver=%s", platform_name, exc_info=True)
+
+    return None
+
+
+def _get_config_callable(config, name):
+    """Return a real config helper method, ignoring MagicMock auto-attributes."""
+    try:
+        instance_attr = vars(config).get(name)
+    except Exception:
+        instance_attr = None
+    if callable(instance_attr):
+        return instance_attr
+
+    class_attr = getattr(type(config), name, None)
+    if callable(class_attr):
+        return getattr(config, name)
+    return None
+
+
+def _resolve_platform_config(config, platform, account_id=None):
+    """Support both GatewayConfig and lightweight test doubles."""
+    getter = _get_config_callable(config, "get_platform_config")
+    if getter:
+        try:
+            return getter(platform, account_id=account_id)
+        except TypeError:
+            return getter(platform)
+
+    platforms = getattr(config, "platforms", {}) or {}
+    return platforms.get(platform)
+
+
+def _resolve_home_channel(config, platform, account_id=None):
+    """Support both GatewayConfig and lightweight test doubles."""
+    getter = _get_config_callable(config, "get_home_channel")
+    if getter:
+        try:
+            return getter(platform, account_id=account_id)
+        except TypeError:
+            return getter(platform)
+    return None
+
+
+def _lookup_runtime_adapter(adapters, account_adapters, platform, account_id=None):
+    """Resolve the best live adapter for a delivery target."""
+    if account_id and account_adapters:
+        adapter = account_adapters.get((platform, account_id))
+        if adapter is not None:
+            return adapter
+    if adapters:
+        return adapters.get(platform)
+    return None
 
 
 def _normalize_deliver_value(deliver) -> str:
@@ -710,7 +798,7 @@ def _send_media_via_adapter(
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(job: dict, content: str, adapters=None, account_adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -731,6 +819,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
+
 
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
@@ -773,6 +862,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         platform_name = target["platform"]
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
+        account_id = target.get("account_id")
 
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
@@ -799,7 +889,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
-        pconfig = config.platforms.get(platform)
+        pconfig = _resolve_platform_config(config, platform, account_id=account_id)
         if not pconfig or not pconfig.enabled:
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
@@ -808,7 +898,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
-        runtime_adapter = (adapters or {}).get(platform)
+        runtime_adapter = _lookup_runtime_adapter(adapters, account_adapters, platform, account_id=account_id)
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             send_metadata = {"thread_id": thread_id} if thread_id else None
@@ -1591,6 +1681,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        "HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID",
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
@@ -1636,6 +1727,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 ""
                 if delivery_target.get("thread_id") is None
                 else str(delivery_target["thread_id"])
+            )
+            _VAR_MAP["HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID"].set(
+                str(delivery_target["account_id"])
+                if delivery_target.get("account_id")
+                else ""
             )
 
         model = job.get("model") or os.getenv("HERMES_MODEL") or ""
@@ -2037,7 +2133,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    account_adapters=None,
+    loop=None,
+    verbose: bool = False,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -2074,7 +2177,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         delivery_error = None
         if should_deliver:
             try:
-                delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                delivery_error = _deliver_result(
+                    job,
+                    deliver_content,
+                    adapters=adapters,
+                    account_adapters=account_adapters,
+                    loop=loop,
+                )
             except Exception as de:
                 delivery_error = str(de)
                 logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -2112,8 +2221,13 @@ def _notify_provider_jobs_changed() -> None:
     except Exception as e:
         logger.debug("on_jobs_changed notify failed: %s", e)
 
-
-def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> int:
+def tick(
+    verbose: bool = True,
+    adapters=None,
+    account_adapters=None,
+    loop=None,
+    sync: bool = True,
+) -> int:
     """
     Check and run all due jobs.
     
@@ -2195,14 +2309,29 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job,
+                adapters=adapters,
+                account_adapters=account_adapters,
+                loop=loop,
+                verbose=verbose,
+            )
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global —
-        # so they MUST run sequentially to avoid corrupting each other.  Jobs
-        # without a workdir leave env untouched and stay parallel-safe.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # Partition due jobs: jobs with a per-job workdir and/or profile touch
+        # process-global runtime state inside run_job. Workdir jobs temporarily
+        # set os.environ["TERMINAL_CWD"]; profile jobs use a context-local
+        # Hermes home override, scheduler _hermes_home hook, and temporary
+        # profile .env load into os.environ with snapshot/restore. They MUST run
+        # sequentially to avoid corrupting each other. Jobs without either field
+        # stay parallel-safe.
+        sequential_jobs = [
+            j for j in due_jobs
+            if (j.get("workdir") or "").strip() or (j.get("profile") or "").strip()
+        ]
+        parallel_jobs = [
+            j for j in due_jobs
+            if not ((j.get("workdir") or "").strip() or (j.get("profile") or "").strip())
+        ]
 
         _results: list = []
         _all_futures: list = []

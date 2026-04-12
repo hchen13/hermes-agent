@@ -2400,6 +2400,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        self._adapters_by_binding: Dict[Any, BasePlatformAdapter] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -2447,7 +2448,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_via_service = False
         self._restart_command_source: Optional[SessionSource] = None
         self._stop_task: Optional[asyncio.Task] = None
-        
+
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
@@ -2519,8 +2520,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
 
         # Track platforms that failed to connect for background reconnection.
-        # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
-        self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
+        # Key: (platform, account_id), Value: {"config": platform_config, "attempts": int, "next_retry": float}
+        self._failed_platforms: Dict[Any, Dict[str, Any]] = {}
 
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
@@ -2642,6 +2643,142 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+
+    def _adapter_binding_key(
+        self,
+        platform: Platform,
+        account_id: Optional[str] = None,
+    ) -> Any:
+        normalized_account = str(account_id or "").strip() or None
+        if normalized_account is None:
+            return platform
+        return (platform, normalized_account)
+
+    def _binding_label(self, platform: Platform, account_id: Optional[str] = None) -> str:
+        if account_id:
+            return f"{platform.value}[{account_id}]"
+        return platform.value
+
+    def _normalize_binding_key(
+        self,
+        binding_key: Any,
+    ) -> tuple[Platform, Optional[str]]:
+        if isinstance(binding_key, tuple):
+            platform = binding_key[0]
+            account_id = binding_key[1] if len(binding_key) > 1 else None
+            return (platform, str(account_id or "").strip() or None)
+        return (binding_key, None)
+
+    def _account_id_for_adapter(self, adapter: BasePlatformAdapter) -> Optional[str]:
+        return str(getattr(adapter, "account_id", "") or "").strip() or None
+
+    def _ensure_adapter_registry(self) -> None:
+        if not hasattr(self, "_adapters_by_binding") or self._adapters_by_binding is None:
+            self._adapters_by_binding = {}
+        if not hasattr(self, "adapters") or self.adapters is None:
+            self.adapters = {}
+        for platform, adapter in list(self.adapters.items()):
+            binding_key = self._adapter_binding_key(
+                platform,
+                str(getattr(adapter, "account_id", "") or "").strip() or None,
+            )
+            self._adapters_by_binding.setdefault(binding_key, adapter)
+        if not hasattr(self, "delivery_router") or self.delivery_router is None:
+            return
+        if not hasattr(self.delivery_router, "account_adapters") or self.delivery_router.account_adapters is None:
+            self.delivery_router.account_adapters = {}
+        self.delivery_router.account_adapters = self._adapters_by_binding
+
+    def _register_adapter(self, platform: Platform, adapter: BasePlatformAdapter) -> None:
+        self._ensure_adapter_registry()
+        account_id = self._account_id_for_adapter(adapter)
+        binding_key = self._adapter_binding_key(platform, account_id)
+        self._adapters_by_binding[binding_key] = adapter
+        default_account_id = self.config.get_default_account_id(platform)
+        if (
+            platform not in self.adapters
+            or account_id is None
+            or (default_account_id and account_id == default_account_id)
+        ):
+            self.adapters[platform] = adapter
+
+        self.delivery_router.adapters = self.adapters
+        self.delivery_router.account_adapters = self._adapters_by_binding
+
+    def _unregister_adapter(self, adapter: BasePlatformAdapter) -> None:
+        self._ensure_adapter_registry()
+        platform = adapter.platform
+        account_id = self._account_id_for_adapter(adapter)
+        binding_key = self._adapter_binding_key(platform, account_id)
+        self._adapters_by_binding.pop(binding_key, None)
+
+        if self.adapters.get(platform) is adapter:
+            replacement = None
+            default_account_id = self.config.get_default_account_id(platform)
+            if default_account_id:
+                replacement = self._adapters_by_binding.get(
+                    self._adapter_binding_key(platform, default_account_id)
+                )
+            if replacement is None:
+                for raw_candidate_key, candidate in self._adapters_by_binding.items():
+                    candidate_platform, _candidate_account_id = self._normalize_binding_key(raw_candidate_key)
+                    if candidate_platform == platform:
+                        replacement = candidate
+                        break
+            if replacement is None:
+                self.adapters.pop(platform, None)
+            else:
+                self.adapters[platform] = replacement
+
+        self.delivery_router.adapters = self.adapters
+        self.delivery_router.account_adapters = self._adapters_by_binding
+
+    def _get_adapter(
+        self,
+        platform: Platform,
+        account_id: Optional[str] = None,
+    ) -> Optional[BasePlatformAdapter]:
+        self._ensure_adapter_registry()
+        if account_id:
+            adapter = self._adapters_by_binding.get(
+                self._adapter_binding_key(platform, account_id)
+            )
+            if adapter is not None:
+                return adapter
+            logger.warning(
+                "No adapter binding found for %s[%s]",
+                platform.value,
+                account_id,
+            )
+            return None
+        return self.adapters.get(platform)
+
+    def _get_adapter_for_source(self, source: Optional[SessionSource]) -> Optional[BasePlatformAdapter]:
+        if source is None:
+            return None
+        return self._get_adapter(source.platform, getattr(source, "account_id", None))
+
+    def _has_home_channel_for_source(self, source: Optional[SessionSource]) -> bool:
+        if source is None or source.platform is None:
+            return False
+        if getattr(self, "config", None):
+            home_channel = self.config.get_home_channel(
+                source.platform,
+                account_id=getattr(source, "account_id", None),
+            )
+            if home_channel and getattr(home_channel, "chat_id", None):
+                return True
+        if source.platform == Platform.FEISHU and getattr(source, "account_id", None):
+            return False
+        env_key = f"{source.platform.value.upper()}_HOME_CHANNEL"
+        return bool(os.getenv(env_key))
+
+    def _all_adapter_instances(self) -> List[tuple[Any, BasePlatformAdapter]]:
+        self._ensure_adapter_registry()
+        return list(self._adapters_by_binding.items())
+
+    def _iter_enabled_bindings(self) -> List[tuple[Platform, Optional[str], Any]]:
+        return self.config.iter_enabled_platform_bindings()
 
 
     def _wire_teams_pipeline_runtime(self) -> None:
@@ -3349,9 +3486,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         If the error is retryable (e.g. network blip, DNS failure), queue the
         platform for background reconnection instead of giving up permanently.
         """
+        self._ensure_adapter_registry()
         logger.error(
             "Fatal %s adapter error (%s): %s",
-            adapter.platform.value,
+            self._binding_label(adapter.platform, self._account_id_for_adapter(adapter)),
             adapter.fatal_error_code or "unknown",
             adapter.fatal_error_message or "unknown error",
         )
@@ -3362,29 +3500,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             error_message=adapter.fatal_error_message,
         )
 
-        existing = self.adapters.get(adapter.platform)
+        binding_key = self._adapter_binding_key(
+            adapter.platform,
+            self._account_id_for_adapter(adapter),
+        )
+        existing = self._adapters_by_binding.get(binding_key)
         if existing is adapter:
             try:
                 await adapter.disconnect()
             finally:
-                self.adapters.pop(adapter.platform, None)
-                self.delivery_router.adapters = self.adapters
+                self._unregister_adapter(adapter)
 
         # Queue retryable failures for background reconnection
         if adapter.fatal_error_retryable:
-            platform_config = self.config.platforms.get(adapter.platform)
-            if platform_config and adapter.platform not in self._failed_platforms:
-                self._failed_platforms[adapter.platform] = {
-                    "config": platform_config,
+            if binding_key not in self._failed_platforms:
+                self._failed_platforms[binding_key] = {
+                    "config": adapter.config,
                     "attempts": 0,
                     "next_retry": time.monotonic() + 30,
                 }
                 logger.info(
                     "%s queued for background reconnection",
-                    adapter.platform.value,
+                    self._binding_label(*self._normalize_binding_key(binding_key)),
                 )
 
-        if not self.adapters and not self._failed_platforms:
+        if not self._adapters_by_binding and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
             if adapter.fatal_error_retryable:
                 self._exit_with_failure = True
@@ -3392,7 +3532,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 logger.error("No connected messaging platforms remain. Shutting down gateway cleanly.")
             await self.stop()
-        elif not self.adapters and self._failed_platforms:
+        elif not self._adapters_by_binding and self._failed_platforms:
             # All platforms are down and queued for background reconnection.
             # Keep the gateway alive so:
             #   • cron jobs still run
@@ -4030,7 +4170,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _BUSY_QUEUE_MAX_PENDING = 32
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._get_adapter_for_source(event.source)
         if not adapter:
             return
         # #28503 — Previously this called ``merge_pending_message_event``
@@ -4113,8 +4253,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True
 
-        # Normal busy case (agent actively running a task)
-        adapter = self.adapters.get(event.source.platform)
+        # --- Normal busy case (agent actively running a task) ---
+        # The user sent a message while the agent is working.  Interrupt the
+        # agent immediately so it stops the current tool-calling loop and
+        # processes the new message.  The pending message is stored in the
+        # adapter so the base adapter picks it up once the interrupted run
+        # returns.  A brief ack tells the user what's happening (debounced
+        # to avoid spam when they fire multiple messages quickly).
+
+        adapter = self._get_adapter_for_source(event.source)
         if not adapter:
             return False  # let default path handle it
 
@@ -5391,10 +5538,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         startup_retryable_errors: list[str] = []
         
         # Initialize and connect each configured platform
-        for platform, platform_config in self.config.platforms.items():
+        for platform, account_id, platform_config in self._iter_enabled_bindings():
             if not platform_config.enabled:
                 continue
             enabled_platform_count += 1
+            binding_label = self._binding_label(platform, account_id)
             
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
@@ -5405,10 +5553,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning(
                         "No adapter for '%s' — is the plugin installed? "
                         "(platform is enabled in config.yaml but no plugin registered it)",
-                        _pval,
+                        binding_label,
                     )
                 else:
-                    logger.warning("No adapter available for %s", _pval)
+                    logger.warning("No adapter available for %s", binding_label)
                 continue
             
             # Set up message + fatal error handlers
@@ -5420,7 +5568,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._busy_text_mode = self._busy_text_mode
             
             # Try to connect
-            logger.info("Connecting to %s...", platform.value)
+            logger.info("Connecting to %s...", binding_label)
             self._update_platform_runtime_status(
                 platform.value,
                 platform_state="connecting",
@@ -5430,18 +5578,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 success = await self._connect_adapter_with_timeout(adapter, platform)
                 if success:
-                    self.adapters[platform] = adapter
+                    self._register_adapter(platform, adapter)
                     self._sync_voice_mode_state_to_adapter(adapter)
                     connected_count += 1
+                    logger.info("✓ %s connected", binding_label)
                     self._update_platform_runtime_status(
                         platform.value,
                         platform_state="connected",
                         error_code=None,
                         error_message=None,
                     )
-                    logger.info("✓ %s connected", platform.value)
                 else:
-                    logger.warning("✗ %s failed to connect", platform.value)
+                    logger.warning("✗ %s failed to connect", binding_label)
                     # Defensive cleanup: a failed connect() may have
                     # allocated resources (aiohttp.ClientSession, poll
                     # tasks, bridge subprocesses) before giving up.
@@ -5464,11 +5612,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             else startup_nonretryable_errors
                         )
                         target.append(
-                            f"{platform.value}: {adapter.fatal_error_message}"
+                            f"{binding_label}: {adapter.fatal_error_message}"
                         )
                         # Queue for reconnection if the error is retryable
                         if adapter.fatal_error_retryable:
-                            self._failed_platforms[platform] = {
+                            self._failed_platforms[self._adapter_binding_key(platform, account_id)] = {
                                 "config": platform_config,
                                 "attempts": 1,
                                 "next_retry": time.monotonic() + 30,
@@ -5481,16 +5629,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             error_message="failed to connect",
                         )
                         startup_retryable_errors.append(
-                            f"{platform.value}: failed to connect"
+                            f"{binding_label}: failed to connect"
                         )
                         # No fatal error info means likely a transient issue — queue for retry
-                        self._failed_platforms[platform] = {
+                        self._failed_platforms[self._adapter_binding_key(platform, account_id)] = {
                             "config": platform_config,
                             "attempts": 1,
                             "next_retry": time.monotonic() + 30,
                         }
             except Exception as e:
-                logger.error("✗ %s error: %s", platform.value, e)
+                logger.error("✗ %s error: %s", binding_label, e)
                 # Same defensive cleanup path for exceptions — an adapter
                 # that raised mid-connect may still have a live
                 # aiohttp.ClientSession or child subprocess.
@@ -5501,9 +5649,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     error_code=None,
                     error_message=str(e),
                 )
-                startup_retryable_errors.append(f"{platform.value}: {e}")
+                startup_retryable_errors.append(f"{binding_label}: {e}")
                 # Unexpected exceptions are typically transient — queue for retry
-                self._failed_platforms[platform] = {
+                self._failed_platforms[self._adapter_binding_key(platform, account_id)] = {
                     "config": platform_config,
                     "attempts": 1,
                     "next_retry": time.monotonic() + 30,
@@ -5691,9 +5839,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background reconnection watcher for platforms that failed at startup
         if self._failed_platforms:
             logger.info(
-                "Starting reconnection watcher for %d failed platform(s): %s",
+                "Starting reconnection watcher for %d failed adapter binding(s): %s",
                 len(self._failed_platforms),
-                ", ".join(p.value for p in self._failed_platforms),
+                ", ".join(
+                    self._binding_label(*self._normalize_binding_key(binding_key))
+                    for binding_key in self._failed_platforms
+                ),
             )
         asyncio.create_task(self._platform_reconnect_watcher())
 
@@ -6150,10 +6301,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
 
             now = time.monotonic()
-            for platform in list(self._failed_platforms.keys()):
+            for raw_binding_key in list(self._failed_platforms.keys()):
                 if not self._running:
                     return
-                info = self._failed_platforms[platform]
+                platform, account_id = self._normalize_binding_key(raw_binding_key)
+                info = self._failed_platforms[raw_binding_key]
                 # Skip paused platforms entirely — they need explicit
                 # /platform resume to come back.
                 if info.get("paused"):
@@ -6161,11 +6313,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if now < info["next_retry"]:
                     continue  # not time yet
 
+                if info["attempts"] >= _MAX_ATTEMPTS:
+                    logger.warning(
+                        "Giving up reconnecting %s after %d attempts",
+                        self._binding_label(platform, account_id), info["attempts"],
+                    )
+                    del self._failed_platforms[raw_binding_key]
+                    continue
+
                 platform_config = info["config"]
                 attempt = info["attempts"] + 1
                 logger.info(
-                    "Reconnecting %s (attempt %d)...",
-                    platform.value, attempt,
+                    "Reconnecting %s (attempt %d/%d)...",
+                    self._binding_label(platform, account_id), attempt, _MAX_ATTEMPTS,
                 )
 
                 adapter = None
@@ -6174,9 +6334,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not adapter:
                         logger.warning(
                             "Reconnect %s: adapter creation returned None, removing from retry queue",
-                            platform.value,
+                            self._binding_label(platform, account_id),
                         )
-                        del self._failed_platforms[platform]
+                        del self._failed_platforms[raw_binding_key]
                         continue
 
                     adapter.set_message_handler(self._handle_message)
@@ -6188,17 +6348,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     success = await self._connect_adapter_with_timeout(adapter, platform)
                     if success:
-                        self.adapters[platform] = adapter
+                        self._register_adapter(platform, adapter)
                         self._sync_voice_mode_state_to_adapter(adapter)
-                        self.delivery_router.adapters = self.adapters
-                        del self._failed_platforms[platform]
+                        del self._failed_platforms[raw_binding_key]
+                        logger.info("✓ %s reconnected successfully", self._binding_label(platform, account_id))
                         self._update_platform_runtime_status(
                             platform.value,
                             platform_state="connected",
                             error_code=None,
                             error_message=None,
                         )
-                        logger.info("✓ %s reconnected successfully", platform.value)
 
                         # Rebuild channel directory with the new adapter
                         try:
@@ -6231,7 +6390,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         logger.warning(
                             "Reconnect %s: non-retryable error (%s), removing from retry queue",
-                            platform.value, adapter.fatal_error_message,
+                            self._binding_label(platform, account_id), adapter.fatal_error_message,
                         )
                         # The adapter is about to be dropped from the queue
                         # without ever being installed on self.adapters, so
@@ -6242,7 +6401,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # gateway hits the 2560-fd limit after ~12h of
                         # failed reconnects at the 300s backoff cap (#37011).
                         await _dispose_unused_adapter(adapter)
-                        del self._failed_platforms[platform]
+                        del self._failed_platforms[raw_binding_key]
                     else:
                         self._update_platform_runtime_status(
                             platform.value,
@@ -6255,7 +6414,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         info["next_retry"] = time.monotonic() + backoff
                         logger.info(
                             "Reconnect %s failed, next retry in %ds",
-                            platform.value, backoff,
+                            self._binding_label(platform, account_id), backoff,
                         )
                         # Same fd-leak concern as the non-retryable branch
                         # above: the adapter failed to connect and is being
@@ -6293,7 +6452,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     info["next_retry"] = time.monotonic() + backoff
                     logger.warning(
                         "Reconnect %s error: %s, next retry in %ds",
-                        platform.value, e, backoff,
+                        self._binding_label(platform, account_id), e, backoff,
                     )
                     # A raised exception during reconnect (connect timeout, DNS
                     # resolution failure, etc.) is inherently transient — keep
@@ -6518,23 +6677,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     self._cleanup_agent_resources(_agent)
 
-            for platform, adapter in list(self.adapters.items()):
+            for raw_binding_key, adapter in self._all_adapter_instances():
+                platform, account_id = self._normalize_binding_key(raw_binding_key)
                 _adapter_started_at = time.monotonic()
                 try:
                     await adapter.cancel_background_tasks()
                 except Exception as e:
-                    logger.debug("✗ %s background-task cancel error: %s", platform.value, e)
+                    logger.debug(
+                        "✗ %s background-task cancel error: %s",
+                        self._binding_label(platform, account_id),
+                        e,
+                    )
                 try:
                     await adapter.disconnect()
                     logger.info(
                         "✓ %s disconnected (%.2fs)",
-                        platform.value,
+                        self._binding_label(platform, account_id),
                         time.monotonic() - _adapter_started_at,
                     )
                 except Exception as e:
                     logger.error(
                         "✗ %s disconnect error after %.2fs: %s",
-                        platform.value,
+                        self._binding_label(platform, account_id),
                         time.monotonic() - _adapter_started_at,
                         e,
                     )
@@ -6568,6 +6732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self.adapters.clear()
             for _session_key in list(self._running_agents):
                 self._release_running_agent_state(_session_key)
+            self._adapters_by_binding.clear()
             self._running_agents.clear()
             self._running_agents_ts.clear()
             if hasattr(self, "_active_session_leases"):
@@ -7113,7 +7278,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _deliver_platform_notice(self, source, content: str) -> None:
         """Deliver a setup/operational notice using platform-specific privacy rules."""
-        adapter = self.adapters.get(source.platform)
+        adapter = self._get_adapter_for_source(source)
         if not adapter:
             return
 
@@ -7225,7 +7390,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
-            if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
+            if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(
+                source.platform,
+                account_id=source.account_id,
+            ) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
@@ -7236,7 +7404,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
-                    adapter = self.adapters.get(source.platform)
+                    adapter = self._get_adapter_for_source(source)
                     if adapter:
                         await adapter.send(
                             source.chat_id,
@@ -7246,7 +7414,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"`hermes pairing approve {platform_name} {code}`"
                         )
                 else:
-                    adapter = self.adapters.get(source.platform)
+                    adapter = self._get_adapter_for_source(source)
                     if adapter:
                         await adapter.send(
                             source.chat_id,
@@ -7549,7 +7717,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 queued_text = event.get_command_args().strip()
                 if not queued_text:
                     return "Usage: /queue <prompt>"
-                adapter = self.adapters.get(source.platform)
+                adapter = self._get_adapter_for_source(source)
                 if adapter:
                     queued_event = MessageEvent(
                         text=queued_text,
@@ -7681,6 +7849,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _cmd_def_inner.name == "footer":
                     return await self._handle_footer_command(event)
 
+            # /sethome updates routing state immediately and must not be
+            # queued as plain text behind an active session.
+            if _cmd_def_inner and _cmd_def_inner.name == "sethome":
+                return await self._handle_set_home_command(event)
+
             # Gateway-handled info/control commands with dedicated
             # running-agent handlers.
             if _cmd_def_inner and _cmd_def_inner.name in _DEDICATED_HANDLERS:
@@ -7700,7 +7873,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # through to interrupt + discard. Without this, commands
             # like /model, /reasoning, /voice, /insights, /title,
             # /resume, /retry, /undo, /compress, /usage,
-            # /reload-mcp, /sethome, /reset (all registered as Discord
+            # /reload-mcp, /reset (all registered as Discord
             # slash commands) would interrupt the agent AND get
             # silently discarded by the slash-command safety net,
             # producing a zero-char response. See #5057, #6252, #10370.
@@ -7712,7 +7885,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if event.message_type == MessageType.PHOTO:
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
-                adapter = self.adapters.get(source.platform)
+                adapter = self._get_adapter_for_source(source)
                 if adapter:
                     merge_pending_message_event(adapter._pending_messages, _quick_key, event)
                 return None
@@ -7756,7 +7929,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
                 # Queue the message so it will be picked up after the
                 # agent starts.
-                adapter = self.adapters.get(source.platform)
+                adapter = self._get_adapter_for_source(source)
                 if adapter:
                     merge_pending_message_event(
                         adapter._pending_messages,
@@ -8860,7 +9033,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     and platform_name not in policy.notify_exclude_platforms
                 )
                 if should_notify:
-                    adapter = self.adapters.get(source.platform)
+                    adapter = self._get_adapter_for_source(source)
                     if adapter:
                         if reset_reason == "suspended":
                             reason_text = "previous session was stopped or interrupted"
@@ -9292,8 +9465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
         if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
             platform_name = source.platform.value
-            env_key = _home_target_env_var(platform_name)
-            if not os.getenv(env_key):
+            if not self._has_home_channel_for_source(source):
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".
@@ -9402,6 +9574,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            # Expand @ context references (@file:, @folder:, @diff, etc.)
+            if "@" in message_text:
+                try:
+                    from agent.context_references import preprocess_context_references_async
+                    from agent.model_metadata import get_model_context_length
+                    _msg_cwd = os.environ.get("MESSAGING_CWD", os.path.expanduser("~"))
+                    _msg_ctx_len = get_model_context_length(
+                        self._model, base_url=self._base_url or "")
+                    _ctx_result = await preprocess_context_references_async(
+                        message_text, cwd=_msg_cwd,
+                        context_length=_msg_ctx_len, allowed_root=_msg_cwd)
+                    if _ctx_result.blocked:
+                        _adapter = self._get_adapter_for_source(source)
+                        if _adapter:
+                            await _adapter.send(
+                                source.chat_id,
+                                "\n".join(_ctx_result.warnings) or "Context injection refused.",
+                            )
+                        return
+                    if _ctx_result.expanded:
+                        message_text = _ctx_result.message
+                except Exception as exc:
+                    logger.debug("@ context reference expansion failed: %s", exc)
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
@@ -9419,7 +9614,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Stop persistent typing indicator now that the agent is done
             try:
-                _typing_adapter = self.adapters.get(source.platform)
+                _typing_adapter = self._get_adapter_for_source(source)
                 if _typing_adapter and hasattr(_typing_adapter, "stop_typing"):
                     await _typing_adapter.stop_typing(source.chat_id)
             except Exception:
@@ -9857,7 +10052,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
                 if response:
-                    _media_adapter = self.adapters.get(source.platform)
+                    _media_adapter = self._get_adapter_for_source(source)
                     if _media_adapter:
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
@@ -9884,7 +10079,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             # Stop typing indicator on error too
             try:
-                _err_adapter = self.adapters.get(source.platform)
+                _err_adapter = self._get_adapter_for_source(source)
                 if _err_adapter and hasattr(_err_adapter, "stop_typing"):
                     await _err_adapter.stop_typing(source.chat_id)
             except Exception:
@@ -10503,6 +10698,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+
     @staticmethod
     def _get_guild_id(event: MessageEvent) -> Optional[int]:
         """Extract Discord guild_id from the raw message object."""
@@ -10520,7 +10716,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._get_adapter_for_source(event.source)
         if not hasattr(adapter, "join_voice_channel"):
             return "Voice channels are not supported on this platform."
 
@@ -10577,7 +10773,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_voice_channel_leave(self, event: MessageEvent) -> str:
         """Leave the Discord voice channel."""
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._get_adapter_for_source(event.source)
         guild_id = self._get_guild_id(event)
 
         if not guild_id or not hasattr(adapter, "leave_voice_channel"):
@@ -10807,7 +11003,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
 
-            adapter = self.adapters.get(event.source.platform)
+            adapter = self._get_adapter_for_source(event.source)
 
             # If connected to a voice channel, play there instead of sending a file
             guild_id = self._get_guild_id(event)
@@ -10985,7 +11181,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_urls = media_urls or []
         media_types = media_types or []
 
-        adapter = self.adapters.get(source.platform)
+        adapter = self._get_adapter_for_source(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
             return
@@ -12536,10 +12732,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.session_context import set_session_vars
         return set_session_vars(
             platform=context.source.platform.value,
+            account_id=context.source.account_id or "",
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
+            user_id_alt=context.source.user_id_alt or "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
@@ -13534,7 +13732,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
         self._invalidate_session_run_generation(session_key, reason=invalidation_reason)
-        adapter = self.adapters.get(source.platform)
+        adapter = self._get_adapter_for_source(source)
         if adapter and hasattr(adapter, "interrupt_session_activity"):
             await adapter.interrupt_session_activity(session_key, source.chat_id)
         if adapter and hasattr(adapter, "get_pending_message"):
@@ -14618,7 +14816,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not progress_queue:
                 return
 
-            adapter = self.adapters.get(source.platform)
+            adapter = self._get_adapter_for_source(source)
             if not adapter:
                 return
 
@@ -14993,7 +15191,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("event_callback hook error: %s", _e)
 
         # Bridge sync status_callback → async adapter.send for context pressure
-        _status_adapter = self.adapters.get(source.platform)
+        _status_adapter = self._get_adapter_for_source(source)
         _status_chat_id = source.chat_id
         if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
             # Feishu topics only keep messages inside the topic when they are
@@ -15121,7 +15319,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-                    _adapter = self.adapters.get(source.platform)
+                    _adapter = self._get_adapter_for_source(source)
                     if _adapter:
                         # Platforms that don't support editing sent messages
                         # (e.g. QQ, WeChat) should skip streaming entirely —
@@ -16049,7 +16247,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _interrupt_detected = asyncio.Event()  # shared with backup check
 
         async def monitor_for_interrupt():
-            if not session_key:
+            adapter = self._get_adapter_for_source(source)
+            if not adapter or not session_key:
                 return
 
             while True:
@@ -16154,7 +16353,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
-            _notify_adapter = self.adapters.get(source.platform)
+            _notify_adapter = self._get_adapter_for_source(source)
             if not _notify_adapter:
                 return
             # Track the heartbeat message id so we can edit-in-place on
@@ -16301,7 +16500,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if (not _warning_fired and _agent_warning is not None
                             and _idle_secs >= _agent_warning):
                         _warning_fired = True
-                        _warn_adapter = self.adapters.get(source.platform)
+                        _warn_adapter = self._get_adapter_for_source(source)
                         if _warn_adapter:
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
@@ -16420,7 +16619,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Check if we were interrupted OR have a queued message (/queue).
             result = result_holder[0]
-            adapter = self.adapters.get(source.platform)
+            adapter = self._get_adapter_for_source(source)
             
             # Get pending message from adapter.
             # Use session_key (not source.chat_id) to match adapter's storage keys.
@@ -16551,8 +16750,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "queueing message instead of recursing.",
                         _interrupt_depth, session_key,
                     )
-                    adapter = self.adapters.get(source.platform)
-                    if adapter and pending_event:
+                    adapter = self._get_adapter_for_source(source)
+                    if adapter and pending_event and hasattr(adapter, "_pending_messages"):
                         merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
@@ -17443,7 +17642,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     cron_thread = threading.Thread(
         target=cron_provider.start,
         args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
+        kwargs={
+            "adapters": runner.adapters,
+            "account_adapters": runner._adapters_by_binding,
+            "loop": asyncio.get_running_loop(),
+        },
         daemon=True,
         name="cron-scheduler",
     )

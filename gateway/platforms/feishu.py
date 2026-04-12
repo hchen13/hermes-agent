@@ -123,6 +123,9 @@ except ImportError:
     FeishuWSClient = None  # type: ignore[assignment]
     FEISHU_DOMAIN = None  # type: ignore[assignment]
     LARK_DOMAIN = None  # type: ignore[assignment]
+    AccessTokenType = None  # type: ignore[assignment]
+    HttpMethod = None  # type: ignore[assignment]
+    BaseRequest = None  # type: ignore[assignment]
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -402,6 +405,7 @@ class FeishuGroupRule:
     """Per-group policy rule for controlling which users may interact with the bot."""
 
     policy: str  # "open" | "allowlist" | "blacklist" | "admin_only" | "disabled"
+    require_mention: Optional[bool] = None
     allowlist: set[str] = field(default_factory=set)
     blacklist: set[str] = field(default_factory=set)
     require_mention: Optional[bool] = None  # None = inherit global
@@ -459,6 +463,15 @@ def _escape_markdown_text(text: str) -> str:
 
 def _to_boolean(value: Any) -> bool:
     return value is True or value == 1 or value == "true"
+
+
+def _resolve_env_reference(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if not text.startswith("env:"):
+        return text
+    return os.getenv(text[4:].strip(), "").strip()
 
 
 def _is_style_enabled(style: Dict[str, Any] | None, key: str) -> bool:
@@ -541,6 +554,23 @@ def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -
 def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
     parsed = _coerce_int(value, default=default, min_value=min_value)
     return default if parsed is None else parsed
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+        return None
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1281,16 +1311,90 @@ def _strip_edge_self_mentions(
             return remaining
 
 
+# ---------------------------------------------------------------------------
+# Multi-account websocket runtime proxies
+#
+# When multiple Feishu accounts share the same process, each runs its own
+# Lark websocket client on its own thread with its own asyncio loop. The
+# Lark SDK reads module-global ``loop`` and ``websockets.connect`` symbols,
+# which would otherwise be a process-wide race. These thread-local proxies
+# dispatch SDK loop/connect calls to the per-thread state set up in
+# ``_run_official_feishu_ws_client`` below.
+# ---------------------------------------------------------------------------
+
+
+_FEISHU_WS_THREAD_STATE = threading.local()
+
+
+def _current_feishu_ws_loop() -> asyncio.AbstractEventLoop:
+    """Resolve the active loop for the current Feishu websocket thread."""
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    loop = getattr(_FEISHU_WS_THREAD_STATE, "loop", None)
+    if loop is None or bool(getattr(loop, "is_closed", lambda: False)()):
+        raise RuntimeError("Feishu websocket loop is not initialized for this thread")
+    return loop
+
+
+class _FeishuWSLoopProxy:
+    """Route the SDK's module-global loop calls to the current thread-local loop."""
+
+    def run_until_complete(self, awaitable: Any) -> Any:
+        loop = getattr(_FEISHU_WS_THREAD_STATE, "loop", None)
+        if loop is None or bool(getattr(loop, "is_closed", lambda: False)()):
+            raise RuntimeError("Feishu websocket thread loop is not available")
+        return loop.run_until_complete(awaitable)
+
+    def create_task(self, coro: Any) -> asyncio.Task[Any]:
+        return _current_feishu_ws_loop().create_task(coro)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_current_feishu_ws_loop(), name)
+
+
+async def _feishu_ws_connect_proxy(*args: Any, **kwargs: Any) -> Any:
+    """Apply thread-local websocket connect overrides without global races."""
+    connect_impl = getattr(_FEISHU_WS_THREAD_STATE, "original_connect", None)
+    if connect_impl is None:
+        raise RuntimeError("Feishu websocket connect proxy is not initialized")
+    ping_interval = getattr(_FEISHU_WS_THREAD_STATE, "ping_interval", None)
+    ping_timeout = getattr(_FEISHU_WS_THREAD_STATE, "ping_timeout", None)
+    if ping_interval is not None and "ping_interval" not in kwargs:
+        kwargs["ping_interval"] = ping_interval
+    if ping_timeout is not None and "ping_timeout" not in kwargs:
+        kwargs["ping_timeout"] = ping_timeout
+    return await connect_impl(*args, **kwargs)
+
+
+def _install_feishu_ws_runtime_proxies(ws_client_module: Any) -> None:
+    """Install process-wide SDK proxies that dispatch via thread-local state."""
+    if not getattr(ws_client_module, "_hermes_ws_proxy_installed", False):
+        original_connect = ws_client_module.websockets.connect
+        setattr(ws_client_module, "_hermes_ws_original_connect", original_connect)
+        ws_client_module.websockets.connect = _feishu_ws_connect_proxy
+        ws_client_module.loop = _FeishuWSLoopProxy()
+        setattr(ws_client_module, "_hermes_ws_proxy_installed", True)
+
+
 def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    ws_client_module.loop = loop
+    _install_feishu_ws_runtime_proxies(ws_client_module)
+    _FEISHU_WS_THREAD_STATE.loop = loop
+    _FEISHU_WS_THREAD_STATE.original_connect = getattr(
+        ws_client_module,
+        "_hermes_ws_original_connect",
+        ws_client_module.websockets.connect,
+    )
+    _FEISHU_WS_THREAD_STATE.ping_interval = adapter._ws_ping_interval
+    _FEISHU_WS_THREAD_STATE.ping_timeout = adapter._ws_ping_timeout
     adapter._ws_thread_loop = loop
 
-    original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
 
     def _apply_runtime_ws_overrides() -> None:
@@ -1302,13 +1406,6 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         except Exception:
             logger.debug("[Feishu] Failed to apply websocket runtime overrides", exc_info=True)
 
-    def _connect_with_overrides(*args: Any, **kwargs: Any) -> Any:
-        if adapter._ws_ping_interval is not None and "ping_interval" not in kwargs:
-            kwargs["ping_interval"] = adapter._ws_ping_interval
-        if adapter._ws_ping_timeout is not None and "ping_timeout" not in kwargs:
-            kwargs["ping_timeout"] = adapter._ws_ping_timeout
-        return original_connect(*args, **kwargs)
-
     def _configure_with_overrides(conf: Any) -> Any:
         if original_configure is None:
             raise RuntimeError("Feishu _configure_with_overrides called but original_configure is None")
@@ -1316,7 +1413,6 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         _apply_runtime_ws_overrides()
         return result
 
-    ws_client_module.websockets.connect = _connect_with_overrides
     if original_configure is not None:
         setattr(ws_client, "_configure", _configure_with_overrides)
     _apply_runtime_ws_overrides()
@@ -1325,7 +1421,6 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     except Exception:
         pass
     finally:
-        ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
             setattr(ws_client, "_configure", original_configure)
         pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
@@ -1342,6 +1437,9 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         except Exception:
             pass
         adapter._ws_thread_loop = None
+        for attr in ("loop", "original_connect", "ping_interval", "ping_timeout"):
+            if hasattr(_FEISHU_WS_THREAD_STATE, attr):
+                delattr(_FEISHU_WS_THREAD_STATE, attr)
 
 
 def check_feishu_requirements() -> bool:
@@ -1477,6 +1575,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
+        account_scoped = bool(str(extra.get("account_id") or "").strip())
         # Parse per-group rules from config
         raw_group_rules = extra.get("group_rules", {})
         group_rules: Dict[str, FeishuGroupRule] = {}
@@ -1491,9 +1590,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     per_chat_require_mention = _to_boolean(rule_cfg.get("require_mention"))
                 group_rules[str(chat_id)] = FeishuGroupRule(
                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
+                    require_mention=per_chat_require_mention,
                     allowlist={str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()},
                     blacklist={str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()},
-                    require_mention=per_chat_require_mention,
                 )
 
         # Bot-level admins
@@ -1502,6 +1601,34 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
+        require_mention = _coerce_optional_bool(extra.get("require_mention"))
+        if require_mention is None:
+            # Multi-account configs must not leak the global env var across
+            # tenants; single-account deployments still honour FEISHU_REQUIRE_MENTION.
+            if not account_scoped:
+                require_mention = _coerce_optional_bool(os.getenv("FEISHU_REQUIRE_MENTION"))
+        if require_mention is None:
+            require_mention = True
+
+        if extra.get("bot_name") not in (None, ""):
+            logger.warning(
+                "[Feishu] Ignoring configured bot_name. Hermes no longer treats bot_name as canonical "
+                "Feishu config; use runtime app identity discovery instead."
+            )
+
+        raw_allowed_group_users = (
+            extra.get("allowed_group_users")
+            if extra.get("allowed_group_users") is not None
+            else ("" if account_scoped else os.getenv("FEISHU_ALLOWED_USERS", ""))
+        )
+        if isinstance(raw_allowed_group_users, (list, tuple, set, frozenset)):
+            allowed_group_users = frozenset(
+                str(item).strip() for item in raw_allowed_group_users if str(item).strip()
+            )
+        else:
+            allowed_group_users = frozenset(
+                item.strip() for item in str(raw_allowed_group_users).split(",") if item.strip()
+            )
 
         # Env-only so adapter and gateway auth bypass share one source; yaml
         # feishu.allow_bots is bridged to this env var at config load.
@@ -1514,25 +1641,29 @@ class FeishuAdapter(BasePlatformAdapter):
             allow_bots = "none"
 
         return FeishuAdapterSettings(
-            app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
-            app_secret=str(extra.get("app_secret") or os.getenv("FEISHU_APP_SECRET", "")).strip(),
-            domain_name=str(extra.get("domain") or os.getenv("FEISHU_DOMAIN", "feishu")).strip().lower(),
-            connection_mode=str(
-                extra.get("connection_mode") or os.getenv("FEISHU_CONNECTION_MODE", "websocket")
+            app_id=_resolve_env_reference(extra.get("app_id")) or str("" if account_scoped else os.getenv("FEISHU_APP_ID", "")).strip(),
+            app_secret=_resolve_env_reference(extra.get("app_secret")) or str("" if account_scoped else os.getenv("FEISHU_APP_SECRET", "")).strip(),
+            domain_name=(
+                _resolve_env_reference(extra.get("domain"))
+                or str("" if account_scoped else os.getenv("FEISHU_DOMAIN", "feishu"))
+                or "feishu"
             ).strip().lower(),
-            encrypt_key=str(extra.get("encrypt_key") or os.getenv("FEISHU_ENCRYPT_KEY", "")).strip(),
-            verification_token=str(
-                extra.get("verification_token") or os.getenv("FEISHU_VERIFICATION_TOKEN", "")
-            ).strip(),
-            group_policy=os.getenv("FEISHU_GROUP_POLICY", "allowlist").strip().lower(),
-            allowed_group_users=frozenset(
-                item.strip()
-                for item in os.getenv("FEISHU_ALLOWED_USERS", "").split(",")
-                if item.strip()
-            ),
-            bot_open_id=os.getenv("FEISHU_BOT_OPEN_ID", "").strip(),
-            bot_user_id=os.getenv("FEISHU_BOT_USER_ID", "").strip(),
-            bot_name=os.getenv("FEISHU_BOT_NAME", "").strip(),
+            connection_mode=str(
+                _resolve_env_reference(extra.get("connection_mode"))
+                or ("" if account_scoped else os.getenv("FEISHU_CONNECTION_MODE", "websocket"))
+                or "websocket"
+            ).strip().lower(),
+            encrypt_key=_resolve_env_reference(extra.get("encrypt_key")) or str("" if account_scoped else os.getenv("FEISHU_ENCRYPT_KEY", "")).strip(),
+            verification_token=_resolve_env_reference(extra.get("verification_token")) or str("" if account_scoped else os.getenv("FEISHU_VERIFICATION_TOKEN", "")).strip(),
+            group_policy=str(
+                _resolve_env_reference(extra.get("group_policy"))
+                or ("" if account_scoped else os.getenv("FEISHU_GROUP_POLICY", "allowlist"))
+                or "allowlist"
+            ).strip().lower(),
+            allowed_group_users=allowed_group_users,
+            bot_open_id=_resolve_env_reference(extra.get("bot_open_id")) or str("" if account_scoped else os.getenv("FEISHU_BOT_OPEN_ID", "")).strip(),
+            bot_user_id=_resolve_env_reference(extra.get("bot_user_id")) or str("" if account_scoped else os.getenv("FEISHU_BOT_USER_ID", "")).strip(),
+            bot_name=str("" if account_scoped else os.getenv("FEISHU_BOT_NAME", "")).strip(),
             dedup_cache_size=max(
                 32,
                 int(os.getenv("HERMES_FEISHU_DEDUP_CACHE_SIZE", str(_DEFAULT_DEDUP_CACHE_SIZE))),
@@ -1572,9 +1703,7 @@ class FeishuAdapter(BasePlatformAdapter):
             default_group_policy=default_group_policy,
             group_rules=group_rules,
             allow_bots=allow_bots,
-            require_mention=_to_boolean(
-                extra.get("require_mention", os.getenv("FEISHU_REQUIRE_MENTION", "true"))
-            ),
+            require_mention=require_mention,
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1585,6 +1714,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._encrypt_key = settings.encrypt_key
         self._verification_token = settings.verification_token
         self._group_policy = settings.group_policy
+        self._require_mention = settings.require_mention
         self._allowed_group_users = set(settings.allowed_group_users)
         self._admins = set(settings.admins)
         self._default_group_policy = settings.default_group_policy or settings.group_policy
@@ -2423,6 +2553,16 @@ class FeishuAdapter(BasePlatformAdapter):
         reason = self._admit(sender, message)
         if reason is not None:
             logger.debug("[Feishu] dropping inbound event: %s", reason)
+            return
+        header = getattr(data, "header", None)
+        event_app_id = str(getattr(header, "app_id", "") or "")
+        if event_app_id and self._app_id and event_app_id != self._app_id:
+            logger.warning(
+                "[Feishu] Dropping inbound message for unexpected app_id: expected=%s actual=%s message_id=%s",
+                self._app_id,
+                event_app_id,
+                message_id,
+            )
             return
 
         chat_type = getattr(message, "chat_type", "p2p")
@@ -4181,7 +4321,7 @@ class FeishuAdapter(BasePlatformAdapter):
     # --- Mention detection ----------------------------------------------------
 
     def _mentions_self(self, message: Any) -> bool:
-        # @_all is Feishu's @everyone placeholder.
+        # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
             return True
@@ -4196,6 +4336,18 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         return self._post_mentions_bot(normalized.mentions)
 
+    def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
+        """Run policy + per-chat require_mention + @mention gate for a group event."""
+        if not self._allow_group_message(sender_id, chat_id):
+            return False
+        rule = self._group_rules.get(chat_id) if chat_id else None
+        require_mention = self._require_mention
+        if rule and rule.require_mention is not None:
+            require_mention = rule.require_mention
+        if not require_mention:
+            return True
+        return self._mentions_self(message)
+
     def _message_mentions_bot(self, mentions: List[Any]) -> bool:
         # IDs trump names: when both sides have open_id (or both user_id),
         # match requires equal IDs. Name fallback only when either side
@@ -4205,14 +4357,15 @@ class FeishuAdapter(BasePlatformAdapter):
             mention_open_id = (getattr(mention_id, "open_id", None) or "").strip()
             mention_user_id = (getattr(mention_id, "user_id", None) or "").strip()
             mention_name = (getattr(mention, "name", None) or "").strip()
+            mention_has_id = bool(mention_open_id or mention_user_id)
 
-            if mention_open_id and self._bot_open_id:
-                if mention_open_id == self._bot_open_id:
-                    return True
-                continue  # IDs differ — not the bot; skip name fallback.
-            if mention_user_id and self._bot_user_id:
-                if mention_user_id == self._bot_user_id:
-                    return True
+            if self._bot_open_id and mention_open_id == self._bot_open_id:
+                return True
+            if self._bot_user_id and mention_user_id == self._bot_user_id:
+                return True
+            if mention_has_id:
+                # Mention carried an ID that didn't match the bot — skip name
+                # fallback for this mention so a same-name human doesn't admit.
                 continue
             if self._bot_name and mention_name == self._bot_name:
                 return True
@@ -4243,39 +4396,42 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return
 
-        # Primary probe: /open-apis/bot/v3/info — returns bot_name + open_id, no
-        # extra scopes required. This is the same endpoint the onboarding wizard
-        # uses via probe_bot().
+        # Primary probe: /open-apis/bot/v3/info — returns bot_name + open_id,
+        # no extra scopes required. Always runs so stale FEISHU_BOT_* env vars
+        # or yaml entries from app/bot migrations are repaired automatically.
         try:
-            req = (
-                BaseRequest.builder()
-                .http_method(HttpMethod.GET)
-                .uri("/open-apis/bot/v3/info")
-                .token_types({AccessTokenType.TENANT})
-                .build()
-            )
-            resp = await asyncio.to_thread(self._client.request, req)
-            content = getattr(getattr(resp, "raw", None), "content", None)
-            if content:
-                payload = json.loads(content)
-                parsed = _parse_bot_response(payload) or {}
-                open_id = (parsed.get("bot_open_id") or "").strip()
-                bot_name = (parsed.get("bot_name") or "").strip()
-                if open_id:
-                    if self._bot_open_id and self._bot_open_id != open_id:
+            request = self._build_get_bot_info_request()
+            response = await asyncio.to_thread(self._client.request, request)
+            # ``response.success()`` exists on lark-oapi SDK responses but not
+            # on the raw HTTP-shaped objects test mocks use. Skip the gate when
+            # the attribute is absent so both shapes hydrate identically.
+            success_check = getattr(response, "success", None)
+            response_ok = success_check() if callable(success_check) else response is not None
+            if response_ok:
+                bot_open_id, bot_name = self._parse_bot_info_response(response)
+                if bot_open_id:
+                    if self._bot_open_id and self._bot_open_id != bot_open_id:
                         logger.warning(
-                            "[Feishu] FEISHU_BOT_OPEN_ID is stale; using /bot/v3/info open_id for group @mention gating."
+                            "[Feishu] Configured bot_open_id is stale; using /bot/v3/info "
+                            "open_id for group @mention gating."
                         )
-                    self._bot_open_id = open_id
+                    self._bot_open_id = bot_open_id
                 if bot_name:
                     if self._bot_name and self._bot_name != bot_name:
                         logger.info(
-                            "[Feishu] FEISHU_BOT_NAME differs from /bot/v3/info; using hydrated bot name for group @mention gating."
+                            "[Feishu] Configured bot_name differs from /bot/v3/info; "
+                            "using hydrated bot name for group @mention gating."
                         )
                     self._bot_name = bot_name
+            elif response:
+                logger.debug(
+                    "[Feishu] bot/v3/info returned code=%s msg=%s",
+                    getattr(response, "code", None),
+                    getattr(response, "msg", None),
+                )
         except Exception:
             logger.debug(
-                "[Feishu] /bot/v3/info probe failed during hydration",
+                "[Feishu] Failed to hydrate bot identity from bot/v3/info",
                 exc_info=True,
             )
 
@@ -4732,6 +4888,67 @@ class FeishuAdapter(BasePlatformAdapter):
                 .build()
             )
         return SimpleNamespace(app_id=app_id, lang=lang)
+
+    @staticmethod
+    def _build_get_bot_info_request() -> Any:
+        if BaseRequest is not None and HttpMethod is not None and AccessTokenType is not None:
+            return (
+                BaseRequest.builder()
+                .http_method(HttpMethod.GET)
+                .uri("/open-apis/bot/v3/info")
+                .token_types({AccessTokenType.TENANT})
+                .build()
+            )
+        return SimpleNamespace(
+            http_method="GET",
+            uri="/open-apis/bot/v3/info",
+            token_types={"tenant"},
+        )
+
+    @staticmethod
+    def _parse_bot_info_response(response: Any) -> tuple[Optional[str], Optional[str]]:
+        payload: Dict[str, Any] = {}
+        raw = getattr(response, "raw", None)
+        raw_content = getattr(raw, "content", None)
+        if isinstance(raw_content, (bytes, bytearray)):
+            try:
+                payload = json.loads(raw_content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                payload = {}
+        elif isinstance(raw_content, str):
+            try:
+                payload = json.loads(raw_content)
+            except json.JSONDecodeError:
+                payload = {}
+
+        bot_payload: Any = None
+        if payload:
+            bot_payload = payload.get("bot")
+            if bot_payload is None:
+                data_payload = payload.get("data")
+                if isinstance(data_payload, dict):
+                    bot_payload = data_payload.get("bot")
+        if bot_payload is None:
+            bot_payload = getattr(response, "bot", None)
+        if bot_payload is None:
+            data_payload = getattr(response, "data", None)
+            if isinstance(data_payload, dict):
+                bot_payload = data_payload.get("bot")
+            elif data_payload is not None:
+                bot_payload = getattr(data_payload, "bot", None)
+
+        if isinstance(bot_payload, dict):
+            open_id = str(bot_payload.get("open_id") or "").strip()
+            bot_name = str(bot_payload.get("bot_name") or bot_payload.get("name") or "").strip()
+            return (open_id or None, bot_name or None)
+
+        open_id = str(getattr(bot_payload, "open_id", "") or "").strip()
+        bot_name = str(
+            getattr(bot_payload, "bot_name", None)
+            or getattr(bot_payload, "name", None)
+            or ""
+        ).strip()
+        return (open_id or None, bot_name or None)
 
     @staticmethod
     def _build_reply_message_body(*, content: str, msg_type: str, reply_in_thread: bool, uuid_value: str) -> Any:
