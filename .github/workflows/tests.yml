@@ -1,6 +1,7 @@
 name: Tests
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths-ignore:
@@ -22,6 +23,10 @@ concurrency:
 
 jobs:
   test:
+    # Keep the upstream full suite available, but do not gate this fork's
+    # runtime branch on upstream-wide tests that are noisy outside the
+    # NousResearch repository. Use Runtime CI as the fork push gate.
+    if: github.repository == 'NousResearch/hermes-agent' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -159,6 +164,8 @@ jobs:
           key: test-durations-${{ github.run_id }}
 
   e2e:
+    # See the test job above. Manual dispatch still runs the full suite on forks.
+    if: github.repository == 'NousResearch/hermes-agent' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
