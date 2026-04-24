@@ -1953,7 +1953,17 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
                 last_response = response
 
-            return self._finalize_send_result(last_response, "send failed")
+            result = self._finalize_send_result(last_response, "send failed")
+            if result.success:
+                logger.info(
+                    "[Feishu] Send succeeded: chat=%s message_id=%s chunks=%d",
+                    chat_id,
+                    result.message_id or "",
+                    len(chunks),
+                )
+            else:
+                logger.warning("[Feishu] Send failed: chat=%s error=%s", chat_id, result.error)
+            return result
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))

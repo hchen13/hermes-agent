@@ -594,6 +594,164 @@ def test_telegram_group_users_mixed_sender_and_legacy_chat(monkeypatch):
     assert runner._is_user_authorized(sender_source) is True
 
 
+def test_feishu_account_dm_policy_open_authorizes_dm(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(
+        Platform.FEISHU,
+        GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "accounts": {
+                            "personal": {
+                                "dm_policy": "open",
+                            },
+                        },
+                    },
+                ),
+            },
+        ),
+    )
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        account_id="personal",
+        user_id="ou_stranger",
+        chat_id="oc_dm",
+        user_name="tester",
+        chat_type="dm",
+    )
+
+    assert runner._is_user_authorized(source) is True
+
+
+def test_feishu_account_dm_policy_allowlist_matches_primary_alt_and_name(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(
+        Platform.FEISHU,
+        GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "accounts": {
+                            "restricted": {
+                                "dm_policy": "allowlist",
+                                "allowed_users": ["ou_allowed", "on_allowed", "Display Name"],
+                            },
+                        },
+                    },
+                ),
+            },
+        ),
+    )
+
+    assert runner._is_user_authorized(
+        SessionSource(
+            platform=Platform.FEISHU,
+            account_id="restricted",
+            user_id="ou_allowed",
+            chat_id="oc_dm",
+            chat_type="dm",
+        )
+    ) is True
+    assert runner._is_user_authorized(
+        SessionSource(
+            platform=Platform.FEISHU,
+            account_id="restricted",
+            user_id="ou_app_scoped",
+            user_id_alt="on_allowed",
+            chat_id="oc_dm",
+            chat_type="dm",
+        )
+    ) is True
+    assert runner._is_user_authorized(
+        SessionSource(
+            platform=Platform.FEISHU,
+            account_id="restricted",
+            user_id="ou_other",
+            user_name="Display Name",
+            chat_id="oc_dm",
+            chat_type="dm",
+        )
+    ) is True
+
+
+def test_feishu_account_dm_policy_does_not_authorize_groups(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(
+        Platform.FEISHU,
+        GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "accounts": {
+                            "personal": {
+                                "dm_policy": "open",
+                            },
+                        },
+                    },
+                ),
+            },
+        ),
+    )
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        account_id="personal",
+        user_id="ou_stranger",
+        chat_id="oc_group",
+        user_name="tester",
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is False
+
+
+@pytest.mark.asyncio
+async def test_feishu_account_allowlist_unknown_dm_uses_account_ignore_behavior(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, adapter = _make_runner(
+        Platform.FEISHU,
+        GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "accounts": {
+                            "restricted": {
+                                "dm_policy": "allowlist",
+                                "allowed_users": ["ou_allowed"],
+                            },
+                        },
+                    },
+                ),
+            },
+        ),
+    )
+
+    result = await runner._handle_message(
+        MessageEvent(
+            text="hello",
+            message_id="m1",
+            source=SessionSource(
+                platform=Platform.FEISHU,
+                account_id="restricted",
+                user_id="ou_stranger",
+                chat_id="oc_dm",
+                user_name="tester",
+                chat_type="dm",
+            ),
+        )
+    )
+
+    assert result is None
+    runner.pairing_store.generate_code.assert_not_called()
+    adapter.send.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_unauthorized_dm_pairs_by_default(monkeypatch):
     _clear_auth_env(monkeypatch)
