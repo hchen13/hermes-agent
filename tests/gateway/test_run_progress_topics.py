@@ -122,6 +122,31 @@ class NonEditingProgressCaptureAdapter(ProgressCaptureAdapter):
         raise AssertionError("non-editable adapters should not receive edit_message calls")
 
 
+class FirstEditFailsAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.edit_attempts = 0
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edit_attempts += 1
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+            }
+        )
+        if self.edit_attempts == 1:
+            return SendResult(
+                success=False,
+                error=(
+                    "HTTPSConnectionPool(host='open.feishu.cn', port=443): "
+                    "Max retries exceeded (Caused by SSLError(SSLEOFError()))"
+                ),
+            )
+        return SendResult(success=True, message_id=message_id)
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't
@@ -198,6 +223,27 @@ class ManyProgressLinesAgent:
         for idx in range(1, 8):
             cb("tool.started", "terminal", f"overflow-line-{idx}-" + "x" * 45, {})
         time.sleep(0.1)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class SpacedProgressAgent:
+    """Emits tool-progress events spaced out so each one triggers an edit attempt."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback("tool.started", "terminal", "first command", {})
+        time.sleep(1.7)
+        self.tool_progress_callback("tool.started", "terminal", "second command", {})
+        time.sleep(1.7)
+        self.tool_progress_callback("tool.started", "terminal", "third command", {})
+        time.sleep(0.2)
         return {
             "final_response": "done",
             "messages": [],
@@ -768,6 +814,30 @@ async def test_run_agent_rolls_progress_bubble_before_platform_limit(monkeypatch
     assert adapter.oversized_edits == []
     all_bubbles = [call["content"] for call in adapter.sent + adapter.edits]
     assert all(len(text) <= adapter.MAX_MESSAGE_LENGTH for text in all_bubbles)
+
+
+@pytest.mark.asyncio
+async def test_tool_progress_does_not_create_new_bubbles_after_transient_edit_failure(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SpacedProgressAgent,
+        session_id="sess-progress-transient-edit-failure",
+        config_data={"display": {"tool_progress": "all"}},
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="group",
+        thread_id=None,
+        adapter_cls=FirstEditFailsAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    progress_sends = [call for call in adapter.sent if "command" in call["content"]]
+    assert len(progress_sends) == 1
+    assert "first command" in progress_sends[0]["content"]
+    assert adapter.edit_attempts >= 1
 
 
 @pytest.mark.asyncio

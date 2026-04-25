@@ -14834,8 +14834,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
             can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
+            edit_failure_count = 0   # Transient-edit-error streak; resets on success
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
+            _MAX_TRANSIENT_EDIT_FAILURES = 3
+
+            def _is_retryable_progress_edit_error(error: str) -> bool:
+                err = (error or "").lower()
+                retryable_markers = (
+                    "flood",
+                    "retry after",
+                    "rate",
+                    "timeout",
+                    "timed out",
+                    "ssl",
+                    "eof",
+                    "connection",
+                    "temporar",
+                    "max retries",
+                    "network",
+                )
+                return any(marker in err for marker in retryable_markers)
+
+            def _record_progress_item(raw):
+                nonlocal progress_msg_id, progress_lines
+                # Handle dedup messages: update last line with repeat counter.
+                if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
+                    _, base_msg, count = raw
+                    if progress_lines:
+                        progress_lines[-1] = f"{base_msg} (×{count + 1})"
+                    return progress_lines[-1] if progress_lines else base_msg
+                if isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                    # Content bubble just landed on the platform — close off
+                    # the current tool-progress bubble so the next tool starts
+                    # below the content instead of editing an older bubble.
+                    progress_msg_id = None
+                    progress_lines = []
+                    last_progress_msg[0] = None
+                    repeat_count[0] = 0
+                    return None
+                progress_lines.append(raw)
+                return raw
 
             _progress_len_fn = (
                 adapter.message_len_fn
@@ -14981,29 +15020,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-                    # Handle dedup messages: update last line with repeat counter
-                    if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
-                        _, base_msg, count = raw
-                        if progress_lines:
-                            progress_lines[-1] = f"{base_msg} (×{count + 1})"
-                        msg = progress_lines[-1] if progress_lines else base_msg
-                    elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
-                        # Content bubble just landed on the platform — close off
-                        # the current tool-progress bubble so the next tool
-                        # starts a fresh bubble below the content. Without this,
-                        # tool lines keep editing the ORIGINAL progress message
-                        # above the new content, making the chat appear out of
-                        # order. Mirrors GatewayStreamConsumer.on_segment_break
-                        # on the content side. (Issue: tool + content
-                        # linearization regression after PR #7885.)
-                        progress_msg_id = None
-                        progress_lines = []
-                        last_progress_msg[0] = None
-                        repeat_count[0] = 0
+                    msg = _record_progress_item(raw)
+                    if msg is None:
                         continue
-                    else:
-                        msg = raw
-                        progress_lines.append(msg)
 
                     if await _roll_progress_overflow_if_needed():
                         _last_edit_ts = time.monotonic()
@@ -15023,7 +15042,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # drain any additional queued messages before sending
                         # a single batched edit.
                         await asyncio.sleep(_remaining)
-                        continue
+                        while True:
+                            try:
+                                _queued_msg = _record_progress_item(progress_queue.get_nowait())
+                                if _queued_msg is not None:
+                                    msg = _queued_msg
+                            except queue.Empty:
+                                break
+                            except Exception:
+                                break
 
                     if not _run_still_current():
                         return
@@ -15034,39 +15061,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         result = await _edit_progress_message(progress_msg_id, full_text)
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
-                            # Transient network errors (ConnectError, timeouts)
-                            # must not permanently disable progress-message
-                            # editing — the next cycle can catch up.  Only
-                            # permanent failures (flood control, message not
-                            # found, permissions) should set can_edit = False.
-                            if getattr(result, "retryable", False):
-                                logger.debug(
-                                    "[%s] Transient edit failure — keeping can_edit=True",
-                                    adapter.name,
-                                )
-                                continue
-                            if "flood" in _err or "retry after" in _err:
-                                # Flood control hit — backoff but keep editing.
-                                # Only disable edits for non-recoverable errors.
-                                logger.info(
-                                    "[%s] Progress edit flood control, backing off",
-                                    adapter.name,
-                                )
-                                _last_edit_ts = time.monotonic()
-                            else:
-                                can_edit = False
-                            _flood_result = await adapter.send(
-                                chat_id=source.chat_id,
-                                content=msg,
-                                reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                            # Transient edit failures (flood control, timeouts,
+                            # connection errors) must not permanently disable
+                            # progress editing — a later edit (or the final
+                            # cancellation-time edit) can catch the same
+                            # progress bubble up without spawning a new chat
+                            # notification per failed retry. Only permanent
+                            # failures (message not found, permissions) flip
+                            # can_edit off after the retry budget is exhausted.
+                            is_retryable = (
+                                bool(getattr(result, "retryable", False))
+                                or _is_retryable_progress_edit_error(_err)
                             )
-                            if (
-                                _cleanup_progress
-                                and getattr(_flood_result, "success", False)
-                                and getattr(_flood_result, "message_id", None)
-                            ):
-                                _cleanup_msg_ids.append(str(_flood_result.message_id))
+                            if is_retryable:
+                                edit_failure_count += 1
+                                if edit_failure_count < _MAX_TRANSIENT_EDIT_FAILURES:
+                                    logger.info(
+                                        "[%s] Progress edit failed transiently; "
+                                        "keeping existing progress message for retry (%d/%d): %s",
+                                        adapter.name,
+                                        edit_failure_count,
+                                        _MAX_TRANSIENT_EDIT_FAILURES,
+                                        getattr(result, "error", "") or "unknown error",
+                                    )
+                                    _last_edit_ts = time.monotonic()
+                                    continue
+                            logger.info(
+                                "[%s] Progress edits disabled for message %s after edit failure: %s",
+                                adapter.name,
+                                progress_msg_id,
+                                getattr(result, "error", "") or "unknown error",
+                            )
+                            can_edit = False
+                        else:
+                            edit_failure_count = 0
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
@@ -15077,14 +15105,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
                             )
+                            if result.success and not result.message_id:
+                                can_edit = False
                         else:
-                            # Editing unsupported: send just this line
-                            result = await adapter.send(
-                                chat_id=source.chat_id,
-                                content=msg,
-                                reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
-                            )
+                            # Editing became unavailable after the first progress
+                            # message. Do not degrade into one new chat bubble per
+                            # tool call; that defeats the entire progress-message
+                            # design on notification-heavy platforms.
+                            continue
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
                             if _cleanup_progress:
