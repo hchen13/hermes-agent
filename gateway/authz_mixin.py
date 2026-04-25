@@ -224,7 +224,10 @@ class GatewayAuthorizationMixin:
         extra = platform_cfg.extra if isinstance(platform_cfg.extra, dict) else {}
 
         if source.platform == Platform.FEISHU:
-            if source.chat_type != "dm":
+            if source.chat_type in {"group", "forum"}:
+                group_auth = self._authorize_feishu_group_policy(source, extra)
+                if group_auth is not None:
+                    return group_auth
                 if any(
                     key in extra
                     for key in (
@@ -239,6 +242,8 @@ class GatewayAuthorizationMixin:
                 ):
                     return True
                 return None
+            if source.chat_type != "dm":
+                return None
 
             dm_policy = str(extra.get("dm_policy", "") or "").strip().lower()
             if str(extra.get("allow_all_users", "")).strip().lower() in {"true", "1", "yes"}:
@@ -250,10 +255,12 @@ class GatewayAuthorizationMixin:
 
             check_ids = {
                 str(value).strip()
-                for value in (source.user_id, source.user_id_alt)
+                for value in (source.user_id, source.user_id_alt, source.user_name)
                 if str(value or "").strip()
             }
-            allowed_ids = self._parse_authorized_id_list(extra.get("allowed_users"))
+            allowed_ids = self._parse_authorized_id_list(
+                extra.get("allowed_users", extra.get("allow_from"))
+            )
 
             if dm_policy == "allowlist":
                 if "*" in allowed_ids:
@@ -267,6 +274,67 @@ class GatewayAuthorizationMixin:
                 return bool(check_ids & allowed_ids)
 
         return None
+
+    def _authorize_feishu_group_policy(
+        self,
+        source: SessionSource,
+        extra: dict[str, Any],
+    ) -> Optional[bool]:
+        """Mirror Feishu adapter group policy at the gateway auth layer."""
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        admins = self._parse_authorized_id_list(extra.get("admins"))
+        if self._source_matches_allowed_user(source, admins):
+            return True
+
+        raw_group_rules = extra.get("group_rules", {})
+        rule = (
+            raw_group_rules.get(chat_id)
+            if isinstance(raw_group_rules, dict) and chat_id
+            else None
+        )
+        if isinstance(rule, dict):
+            policy = str(rule.get("policy", "open") or "open").strip().lower()
+            allowlist = self._parse_authorized_id_list(rule.get("allowlist"))
+            blacklist = self._parse_authorized_id_list(rule.get("blacklist"))
+        else:
+            policy = str(
+                extra.get("default_group_policy")
+                or extra.get("group_policy")
+                or ""
+            ).strip().lower()
+            allowlist = self._parse_authorized_id_list(extra.get("allowed_group_users"))
+            blacklist = set()
+
+        if not policy:
+            return None
+        if policy == "open":
+            return True
+        if policy in {"disabled", "admin_only"}:
+            return False
+        if policy == "allowlist":
+            return self._source_matches_allowed_user(source, allowlist)
+        if policy == "blacklist":
+            return not self._source_matches_allowed_user(source, blacklist)
+
+        return self._source_matches_allowed_user(source, allowlist)
+
+    @staticmethod
+    def _source_matches_allowed_user(
+        source: SessionSource,
+        allowed_users: set[str],
+    ) -> bool:
+        if "*" in allowed_users:
+            return True
+        identities = {
+            str(value).strip()
+            for value in (
+                getattr(source, "user_id", None),
+                getattr(source, "user_id_alt", None),
+                getattr(source, "user_name", None),
+            )
+            if value is not None and str(value).strip()
+        }
+        return bool(identities & allowed_users)
 
     def _is_user_authorized(self, source: SessionSource) -> bool:
         """

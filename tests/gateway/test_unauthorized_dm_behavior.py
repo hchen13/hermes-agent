@@ -710,6 +710,120 @@ def test_feishu_account_dm_policy_does_not_authorize_groups(monkeypatch):
     assert runner._is_user_authorized(source) is False
 
 
+def test_feishu_account_group_policy_open_authorizes_group(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(
+        Platform.FEISHU,
+        GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "accounts": {
+                            "personal": {
+                                "group_policy": "open",
+                            },
+                        },
+                    },
+                ),
+            },
+        ),
+    )
+
+    source = SessionSource(
+        platform=Platform.FEISHU,
+        account_id="personal",
+        user_id="ae5dg51b",
+        chat_id="oc_group",
+        user_name="Ethan",
+        chat_type="group",
+    )
+
+    assert runner._is_user_authorized(source) is True
+
+
+def test_feishu_account_group_policy_allowlist_matches_alt_id(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(
+        Platform.FEISHU,
+        GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "accounts": {
+                            "restricted": {
+                                "group_policy": "allowlist",
+                                "allowed_group_users": ["on_allowed"],
+                            },
+                        },
+                    },
+                ),
+            },
+        ),
+    )
+
+    assert runner._is_user_authorized(
+        SessionSource(
+            platform=Platform.FEISHU,
+            account_id="restricted",
+            user_id="ae5dg51b",
+            user_id_alt="on_allowed",
+            chat_id="oc_group",
+            user_name="Ethan",
+            chat_type="group",
+        )
+    ) is True
+    assert runner._is_user_authorized(
+        SessionSource(
+            platform=Platform.FEISHU,
+            account_id="restricted",
+            user_id="ae5dg51b",
+            user_id_alt="on_denied",
+            chat_id="oc_group",
+            user_name="Ethan",
+            chat_type="group",
+        )
+    ) is False
+
+
+def test_feishu_account_group_rule_open_authorizes_group(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    runner, _adapter = _make_runner(
+        Platform.FEISHU,
+        GatewayConfig(
+            platforms={
+                Platform.FEISHU: PlatformConfig(
+                    enabled=True,
+                    extra={
+                        "accounts": {
+                            "personal": {
+                                "group_policy": "allowlist",
+                                "group_rules": {
+                                    "oc_open": {
+                                        "policy": "open",
+                                    },
+                                },
+                            },
+                        },
+                    },
+                ),
+            },
+        ),
+    )
+
+    assert runner._is_user_authorized(
+        SessionSource(
+            platform=Platform.FEISHU,
+            account_id="personal",
+            user_id="ae5dg51b",
+            chat_id="oc_open",
+            user_name="Ethan",
+            chat_type="group",
+        )
+    ) is True
+
+
 @pytest.mark.asyncio
 async def test_feishu_account_allowlist_unknown_dm_uses_account_ignore_behavior(monkeypatch):
     _clear_auth_env(monkeypatch)
