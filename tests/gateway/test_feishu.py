@@ -3558,6 +3558,80 @@ class TestAdapterBehavior(unittest.TestCase):
             )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_auto_image_caption_routes_bare_table_to_card(self):
+        # B4 regression: image+caption `auto` heuristic must use the same
+        # card-routing decision as `_build_outbound_payload`. A bare GFM
+        # table with no other markdown hints should go to card so the
+        # table renders, not be silently dropped on the post path.
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"outbound_format": "auto"}))
+        msg_type, payload = adapter._build_image_caption_payload(
+            caption="| color | pct |\n|---|---|\n| red | 60% |",
+            image_key="img_test",
+        )
+        self.assertEqual(msg_type, "interactive")
+        card = json.loads(payload)
+        self.assertEqual(card["schema"], "2.0")
+        elements = card["body"]["elements"]
+        self.assertEqual(elements[0]["tag"], "markdown")
+        self.assertIn("| color | pct |", elements[0]["content"])
+        self.assertEqual(elements[1]["tag"], "img")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_image_file_strips_caption_whitespace(self):
+        # B5 regression: caption must be normalized via format_message so
+        # trailing/leading whitespace doesn't leak into the wire payload.
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"outbound_format": "card"}))
+        captured = {"create_calls": []}
+
+        class _ImageAPI:
+            def create(self, request):
+                return SimpleNamespace(
+                    success=lambda: True, data=SimpleNamespace(image_key="img_strip_key")
+                )
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["create_calls"].append(request)
+                return SimpleNamespace(
+                    success=lambda: True, data=SimpleNamespace(message_id="om_strip")
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(image=_ImageAPI(), message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(b"fake-png")
+            tmp_path = f.name
+        try:
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                asyncio.run(
+                    adapter.send_image_file(
+                        chat_id="oc_chat",
+                        image_path=tmp_path,
+                        caption="  **bold** caption with whitespace  \r\n",
+                    )
+                )
+        finally:
+            os.unlink(tmp_path)
+
+        card = json.loads(captured["create_calls"][0].request_body.content)
+        # Caption element content should be stripped — no leading/trailing
+        # whitespace, no \r artifacts.
+        caption_text = card["body"]["elements"][0]["content"]
+        self.assertEqual(caption_text, caption_text.strip())
+        self.assertNotIn("\r", caption_text)
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_records_text_msg_type_after_card_fallback(self):
         # B2 regression: when card-invalid causes fallback to text, the
         # recorded msg_type must reflect the actual wire type ("text"),

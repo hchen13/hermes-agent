@@ -2802,6 +2802,11 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
 
             if caption:
+                # Normalize caption the same way `send` does so trailing
+                # whitespace / CR-LF artifacts don't leak into the post or
+                # card payload.
+                caption = self.format_message(caption)
+            if caption:
                 msg_type, payload = self._build_image_caption_payload(
                     caption=caption, image_key=image_key
                 )
@@ -5073,28 +5078,49 @@ class FeishuAdapter(BasePlatformAdapter):
     # versus post under typical Feishu render UX.
     _AUTO_CARD_LENGTH_THRESHOLD = 1500
 
+    def _has_markdown(self, prepared: str) -> bool:
+        """Return True if *prepared* needs the rich renderer.
+
+        Bare GFM tables don't match `_MARKDOWN_HINT_RE` (the hint regex
+        predates the migration), but they still require schema 2.0 cards
+        to render correctly — count them as markdown.
+        """
+        return bool(_MARKDOWN_HINT_RE.search(prepared)) or _content_has_markdown_table(prepared)
+
+    def _should_use_card(self, prepared: str) -> bool:
+        """Resolve whether *prepared* should be sent as a schema 2.0 card.
+
+        Caller is responsible for first deciding whether the content is
+        markdown at all (via `_has_markdown`); this method only chooses
+        between card and post for content that does need rich rendering.
+
+        Used by both `_build_outbound_payload` and `_build_image_caption_payload`
+        so the two paths cannot drift in their `auto` heuristic — a divergence
+        bug shipped in Phase 1 where image+caption auto required
+        `_MARKDOWN_HINT_RE` AND a heavy signal, silently dropping bare-table
+        captions on the post path.
+        """
+        fmt = self._outbound_format
+        if fmt == "card":
+            return True
+        if fmt == "post":
+            return False
+        # "auto": prefer card when post `md` is likely to misrender — i.e.
+        # the content has a GFM table, a fenced code block, or the message
+        # is long. The 1500-char threshold is a guess; revisit with telemetry.
+        return (
+            _content_has_markdown_table(prepared)
+            or "```" in prepared
+            or len(prepared) >= self._AUTO_CARD_LENGTH_THRESHOLD
+        )
+
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
         # Apply table-mode preprocessing first so heuristics below see the
         # transformed text. `native`/`off` short-circuit to no-op.
         prepared = _convert_markdown_tables(content, self._markdown_table_mode)
-        # Bare GFM tables don't match _MARKDOWN_HINT_RE, but they still need
-        # the rich renderer — count them as markdown.
-        is_markdown = bool(_MARKDOWN_HINT_RE.search(prepared)) or _content_has_markdown_table(prepared)
-        if not is_markdown:
+        if not self._has_markdown(prepared):
             return "text", json.dumps({"text": prepared}, ensure_ascii=False)
-
-        fmt = self._outbound_format
-        if fmt == "post":
-            return "post", _build_markdown_post_payload(prepared)
-        if fmt == "card":
-            return "interactive", _build_markdown_card_payload(prepared)
-        # "auto": prefer card when post `md` is likely to misrender — i.e.
-        # there's a table, a fenced code block, or the message is long.
-        if (
-            _content_has_markdown_table(prepared)
-            or "```" in prepared
-            or len(prepared) >= self._AUTO_CARD_LENGTH_THRESHOLD
-        ):
+        if self._should_use_card(prepared):
             return "interactive", _build_markdown_card_payload(prepared)
         return "post", _build_markdown_post_payload(prepared)
 
@@ -5111,19 +5137,7 @@ class FeishuAdapter(BasePlatformAdapter):
         """
         prepared_caption = _convert_markdown_tables(caption, self._markdown_table_mode)
 
-        fmt = self._outbound_format
-        use_card = fmt == "card"
-        if fmt == "auto":
-            use_card = bool(
-                _MARKDOWN_HINT_RE.search(prepared_caption)
-                and (
-                    _content_has_markdown_table(prepared_caption)
-                    or "```" in prepared_caption
-                    or len(prepared_caption) >= self._AUTO_CARD_LENGTH_THRESHOLD
-                )
-            )
-
-        if use_card:
+        if self._should_use_card(prepared_caption):
             return (
                 "interactive",
                 _build_image_card_payload(
