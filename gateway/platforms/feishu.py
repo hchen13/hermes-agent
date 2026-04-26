@@ -724,12 +724,27 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
 #   https://open.feishu.cn/document/feishu-cards/card-json-v2-structure
 
 
+# Phase 1 testing exposed a Feishu mobile regression: long code blocks render
+# with a "20 行代码 >" preview footer that should be tappable to expand, but
+# the tap is unresponsive in card mode (works in post). We try the three
+# documented schema 2.0 config flags that *might* affect mobile interaction:
+#   - width_mode "fill": full-width on mobile (vs. compact 400px)
+#   - enable_forward_interaction: keep interactive elements live after forward
+#   - omit `wide_screen_mode`: schema 1.0 leftover, undocumented in 2.0
+# If this combination doesn't restore the tap, the regression is a Feishu
+# client behavior we can't fix from the payload side.
+_CARD_CONFIG: Dict[str, Any] = {
+    "width_mode": "fill",
+    "enable_forward_interaction": True,
+}
+
+
 def _build_markdown_card_payload(content: str) -> str:
     """Build a schema 2.0 interactive-card payload carrying free-form markdown."""
     return json.dumps(
         {
             "schema": "2.0",
-            "config": {"wide_screen_mode": True},
+            "config": _CARD_CONFIG,
             "body": {"elements": [{"tag": "markdown", "content": content}]},
         },
         ensure_ascii=False,
@@ -761,7 +776,7 @@ def _build_image_card_payload(*, caption: str, image_key: str) -> str:
     return json.dumps(
         {
             "schema": "2.0",
-            "config": {"wide_screen_mode": True},
+            "config": _CARD_CONFIG,
             "body": {"elements": elements},
         },
         ensure_ascii=False,

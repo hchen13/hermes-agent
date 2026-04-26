@@ -3113,7 +3113,8 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(captured["request"].request_body.msg_type, "interactive")
         card = json.loads(captured["request"].request_body.content)
         self.assertEqual(card["schema"], "2.0")
-        self.assertTrue(card["config"]["wide_screen_mode"])
+        self.assertEqual(card["config"]["width_mode"], "fill")
+        self.assertTrue(card["config"]["enable_forward_interaction"])
         elements = card["body"]["elements"]
         self.assertEqual(len(elements), 1)
         self.assertEqual(elements[0]["tag"], "markdown")
@@ -3484,7 +3485,7 @@ class TestAdapterBehavior(unittest.TestCase):
 
         card = {
             "schema": "2.0",
-            "config": {"wide_screen_mode": True},
+            "config": {"width_mode": "fill", "enable_forward_interaction": True},
             "body": {
                 "elements": [
                     {"tag": "markdown", "content": "**hello** with table"},
