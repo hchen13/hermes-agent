@@ -3497,6 +3497,103 @@ class TestAdapterBehavior(unittest.TestCase):
         # schema 2.0 markdown content the body text walker descends into
         # body.elements[*].content via the generic key/value walk.
         self.assertEqual(normalized.relation_kind, "interactive")
+        self.assertIn("hello", normalized.text_content)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_records_msg_type_for_every_chunk(self):
+        # B1 regression: multi-chunk sends must record msg_type for each
+        # chunk's message_id, not just the final one. Subsequent edits can
+        # target any chunk, and a cache miss would route to the wrong API
+        # surface (patch vs update).
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"outbound_format": "card"}))
+        # Force chunking: shrink the threshold so a small message produces
+        # multiple chunks via base.truncate_message.
+        adapter.MAX_MESSAGE_LENGTH = 60
+
+        emitted_ids: list[str] = []
+
+        class _MessageAPI:
+            def create(self, request):
+                mid = f"om_chunk_{len(emitted_ids)}"
+                emitted_ids.append(mid)
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id=mid),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        # Long enough markdown content to force >1 chunk under the lowered
+        # MAX_MESSAGE_LENGTH=60. truncate_message preserves fence boundaries
+        # but a plain bold-only paragraph splits on newline/space.
+        content = (
+            "**bold para 1** with text that runs long enough to force a split.\n\n"
+            "**bold para 2** also with enough characters to land in the next chunk.\n\n"
+            "**bold para 3** rounds it out for the third chunk."
+        )
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content=content))
+
+        self.assertTrue(result.success)
+        # Sanity: chunking actually happened (otherwise this test asserts
+        # nothing meaningful about per-chunk behavior).
+        self.assertGreater(len(emitted_ids), 1, "expected multi-chunk send")
+        # Every chunk's message_id must have a recorded msg_type — a single
+        # post-loop record would only catch the final chunk and silently
+        # leave earlier ones absent from the cache. The recorded type must
+        # be a valid wire type (not a fallback to "text" via dispatch error).
+        for mid in emitted_ids:
+            self.assertIn(
+                adapter._sent_msg_types.get(mid),
+                {"interactive", "post", "text"},
+                f"missing record for {mid}",
+            )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_records_text_msg_type_after_card_fallback(self):
+        # B2 regression: when card-invalid causes fallback to text, the
+        # recorded msg_type must reflect the actual wire type ("text"),
+        # not the originally-resolved "interactive". Otherwise edit_message
+        # routes to patch on a text message and Feishu rejects.
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"outbound_format": "card"}))
+        captured = {"calls": []}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["calls"].append(request)
+                if len(captured["calls"]) == 1:
+                    raise RuntimeError("invalid card content")
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_after_fallback"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="**hi**"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["calls"][0].request_body.msg_type, "interactive")
+        self.assertEqual(captured["calls"][1].request_body.msg_type, "text")
+        # Recorded type must be the wire type, not the originally-routed one.
+        self.assertEqual(adapter._sent_msg_types.get("om_after_fallback"), "text")
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")

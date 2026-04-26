@@ -2323,8 +2323,15 @@ class FeishuAdapter(BasePlatformAdapter):
         last_response = None
 
         try:
+            # Track the msg_type actually used for the most recently sent
+            # chunk. Differs from the chunk's resolved msg_type when an
+            # invalid-payload fallback degraded the send to plain text — in
+            # that case `_sent_msg_types` must record "text" so a subsequent
+            # edit picks the right Feishu API surface (update, not patch).
+            last_actual_msg_type = "text"
             for chunk in chunks:
                 msg_type, payload = self._build_outbound_payload(chunk)
+                actual_msg_type = msg_type
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -2345,6 +2352,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     if fallback_response is None:
                         raise
                     response = await fallback_response
+                    actual_msg_type = "text"
                 fallback_response = self._maybe_fallback_to_text_on_response(
                     msg_type=msg_type,
                     chunk=chunk,
@@ -2355,18 +2363,26 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 if fallback_response is not None:
                     response = await fallback_response
+                    actual_msg_type = "text"
                 last_response = response
+                last_actual_msg_type = actual_msg_type
+                # Record per chunk: each chunk gets its own message_id from
+                # Feishu, and an edit can target any of them. Recording only
+                # the final chunk would silently leave the earlier ones
+                # without a tracked type, causing edit_message to choose the
+                # wrong API surface (patch vs update) on cache miss.
+                chunk_result = self._finalize_send_result(response, "send failed")
+                if chunk_result.success and chunk_result.message_id:
+                    self._record_sent_msg_type(chunk_result.message_id, actual_msg_type)
 
             result = self._finalize_send_result(last_response, "send failed")
             if result.success:
-                if result.message_id:
-                    self._record_sent_msg_type(result.message_id, msg_type)
                 logger.info(
                     "[Feishu] Send succeeded: chat=%s message_id=%s chunks=%d msg_type=%s",
                     chat_id,
                     result.message_id or "",
                     len(chunks),
-                    msg_type,
+                    last_actual_msg_type,
                 )
             else:
                 logger.warning("[Feishu] Send failed: chat=%s error=%s", chat_id, result.error)
