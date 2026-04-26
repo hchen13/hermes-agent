@@ -98,6 +98,8 @@ try:
         GetMessageRequest,
         GetMessageResourceRequest,
         P2ImMessageMessageReadV1,
+        PatchMessageRequest,
+        PatchMessageRequestBody,
         ReplyMessageRequest,
         ReplyMessageRequestBody,
         UpdateMessageRequest,
@@ -166,6 +168,20 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+# Card payloads can be rejected for malformed JSON, unsupported elements, or
+# content over Feishu's per-element limits. The error string surface is broader
+# than post's, so the pattern is intentionally permissive — tune from real
+# telemetry as Phase 2 lands.
+_CARD_CONTENT_INVALID_RE = re.compile(
+    r"invalid\s+card|card.*format.*incorrect|card.*content.*invalid|invalid\s+template",
+    re.IGNORECASE,
+)
+# GFM pipe-table delimiter row: optional outer pipes, cells of dashes (with
+# optional :alignment: markers) separated by '|'. Requires ≥1 internal pipe so
+# bare '---' horizontal rules are NOT matched.
+_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$"
+)
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -396,8 +412,23 @@ class FeishuAdapterSettings:
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
+    # Outbound formatting strategy (Phase 1 default: "post" — unchanged behavior).
+    #   "post": legacy {tag:"md"} post messages (table-broken).
+    #   "card": always emit schema 2.0 interactive cards for markdown content.
+    #   "auto": emit cards only when content actually needs the richer renderer
+    #           (contains a GFM table, fenced code, or exceeds 1500 chars).
+    outbound_format: str = "post"
+    # GFM table preprocessing applied before card/post serialization.
+    #   "native"/"off": no transform (cards render natively).
+    #   "code":         wrap pipe tables in ``` fences (monospace fallback).
+    #   "bullets":      flatten each row into a bullet list (narrow clients).
+    markdown_table_mode: str = "native"
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+
+
+_VALID_OUTBOUND_FORMATS = {"post", "card", "auto"}
+_VALID_TABLE_MODES = {"native", "off", "code", "bullets"}
 
 
 @dataclass
@@ -573,6 +604,43 @@ def _coerce_optional_bool(value: Any) -> Optional[bool]:
     return None
 
 
+def _is_card_msg_type(msg_type: str) -> bool:
+    """Return True for Feishu card-family msg_types ('interactive')."""
+    return msg_type == "interactive"
+
+
+def _resolve_enum_setting(
+    explicit: Any,
+    *,
+    env_name: str,
+    valid: set[str],
+    default: str,
+) -> str:
+    """Resolve an enum-valued setting from explicit > env > default.
+
+    Invalid values fall back to the default with a logged warning so a typo
+    in config does not silently change runtime behavior.
+    """
+    candidates: List[Any] = [explicit, os.getenv(env_name)]
+    for raw in candidates:
+        if raw is None:
+            continue
+        text = str(raw).strip().lower()
+        if not text:
+            continue
+        if text in valid:
+            return text
+        logger.warning(
+            "[Feishu] Ignoring invalid value %r for %s; using default %r (valid: %s)",
+            text,
+            env_name,
+            default,
+            sorted(valid),
+        )
+        break
+    return default
+
+
 # ---------------------------------------------------------------------------
 # Post payload builders and parsers
 # ---------------------------------------------------------------------------
@@ -637,6 +705,197 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
 
     _flush_current()
     return rows or [[{"tag": "md", "text": content}]]
+
+
+# ---------------------------------------------------------------------------
+# Schema 2.0 card builders
+# ---------------------------------------------------------------------------
+#
+# Schema 2.0 cards expose a richer markdown renderer (lark_md) that supports
+# GFM pipe tables, fenced code with line numbers, and embedded images via
+# `tag: "img"` body elements. Post messages with `{tag: "md"}` rows go through
+# a more limited parser that silently drops table syntax and historically
+# also dropped trailing content after fenced code blocks (the latter is why
+# `_build_markdown_post_rows` exists).
+#
+# These builders match openclaw's approach in
+# `~/.openclaw/extensions/feishu/src/send.ts` (`buildMarkdownCard`).
+# Schema 2.0 is documented at:
+#   https://open.feishu.cn/document/feishu-cards/card-json-v2-structure
+
+
+def _build_markdown_card_payload(content: str) -> str:
+    """Build a schema 2.0 interactive-card payload carrying free-form markdown."""
+    return json.dumps(
+        {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "body": {"elements": [{"tag": "markdown", "content": content}]},
+        },
+        ensure_ascii=False,
+    )
+
+
+def _build_image_card_payload(*, caption: str, image_key: str) -> str:
+    """Build a schema 2.0 card combining a markdown caption with an embedded image.
+
+    Used by `send_image_file` when both an image and a caption are provided —
+    schema 2.0 cards are the only outbound surface where the caption can carry
+    a markdown table without being mangled.
+
+    Note: Feishu's schema 2.0 card body has no `file`/`media`/`audio`/`video`
+    component, so file/audio/video + caption combinations stay on the post
+    path (see `_send_uploaded_file_message`). Only images can be card-embedded.
+    """
+    elements: List[Dict[str, Any]] = []
+    caption_text = (caption or "").strip()
+    if caption_text:
+        elements.append({"tag": "markdown", "content": caption_text})
+    elements.append(
+        {
+            "tag": "img",
+            "img_key": image_key,
+            "alt": {"tag": "plain_text", "content": ""},
+        }
+    )
+    return json.dumps(
+        {
+            "schema": "2.0",
+            "config": {"wide_screen_mode": True},
+            "body": {"elements": elements},
+        },
+        ensure_ascii=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GFM markdown table conversion (for clients that don't render pipe tables)
+# ---------------------------------------------------------------------------
+#
+# Mirrors the openclaw `convertMarkdownTables` helper but in Python. We only
+# implement the modes Hermes actually needs: `native` / `off` (pass-through),
+# `code` (wrap in ``` fences so monospace alignment survives even on parsers
+# that strip pipes), and `bullets` (one bullet per cell — useful for ultra-
+# narrow clients). Schema 2.0 cards render `native` correctly.
+_TABLE_PIPE_LINE_RE = re.compile(r"^\s*\|?[^\n]*\|[^\n]*$")
+
+
+def _convert_markdown_tables(content: str, mode: str) -> str:
+    """Pre-process GFM pipe tables in *content* according to *mode*.
+
+    Modes:
+      - "native" / "off": pass-through (cards render natively; off opts out).
+      - "code": wrap each detected table in a fenced code block.
+      - "bullets": flatten each row into "- header: value, ..." lines.
+    """
+    if not content or mode in ("native", "off"):
+        return content
+    if "|" not in content or "-" not in content:
+        return content
+
+    lines = content.split("\n")
+    out: List[str] = []
+    in_fence = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.lstrip()
+
+        # Never touch tables inside existing fenced code blocks.
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            out.append(line)
+            i += 1
+            continue
+        if in_fence:
+            out.append(line)
+            i += 1
+            continue
+
+        # GFM table: header row with '|' immediately followed by a delimiter
+        # row matching _TABLE_SEPARATOR_RE.
+        if (
+            "|" in line
+            and i + 1 < len(lines)
+            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
+        ):
+            header_row = line
+            delimiter_row = lines[i + 1]
+            body_rows: List[str] = []
+            j = i + 2
+            while j < len(lines):
+                candidate = lines[j]
+                if not candidate.strip():
+                    break
+                if "|" not in candidate:
+                    break
+                body_rows.append(candidate)
+                j += 1
+
+            if mode == "code":
+                out.append("```")
+                out.append(header_row)
+                out.append(delimiter_row)
+                out.extend(body_rows)
+                out.append("```")
+            elif mode == "bullets":
+                headers = [c.strip() for c in _split_pipe_row(header_row)]
+                for row in body_rows:
+                    cells = [c.strip() for c in _split_pipe_row(row)]
+                    if not cells:
+                        continue
+                    pieces: List[str] = []
+                    for idx, cell in enumerate(cells):
+                        header = headers[idx] if idx < len(headers) else ""
+                        if header:
+                            pieces.append(f"{header}: {cell}")
+                        else:
+                            pieces.append(cell)
+                    out.append("- " + ", ".join(pieces))
+            else:
+                # Unknown mode → pass through unchanged.
+                out.append(header_row)
+                out.append(delimiter_row)
+                out.extend(body_rows)
+            i = j
+            continue
+
+        out.append(line)
+        i += 1
+
+    return "\n".join(out)
+
+
+def _split_pipe_row(row: str) -> List[str]:
+    """Split a GFM table row on '|', stripping the outer empty cells."""
+    parts = row.split("|")
+    if parts and not parts[0].strip():
+        parts = parts[1:]
+    if parts and not parts[-1].strip():
+        parts = parts[:-1]
+    return parts
+
+
+def _content_has_markdown_table(content: str) -> bool:
+    """Return True if *content* contains a GFM pipe table outside fenced code."""
+    if "|" not in content or "-" not in content:
+        return False
+    lines = content.split("\n")
+    in_fence = False
+    for i, line in enumerate(lines):
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if (
+            "|" in line
+            and i + 1 < len(lines)
+            and _TABLE_SEPARATOR_RE.match(lines[i + 1])
+        ):
+            return True
+    return False
 
 
 def parse_feishu_post_payload(
@@ -1552,6 +1811,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._chat_locks: "collections.OrderedDict[str, asyncio.Lock]" = collections.OrderedDict()  # chat_id → lock (per-chat serial processing, LRU-bounded)
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
+        # message_id → msg_type ("interactive" | "post" | "text") so edits can
+        # pick the right Feishu API surface (patch for cards, update for the
+        # rest). Capped to the same LRU window as _sent_message_ids_to_chat.
+        self._sent_msg_types: Dict[str, str] = {}
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
         self._message_text_cache: "OrderedDict[str, Optional[str]]" = OrderedDict()
         self._app_lock_identity: Optional[str] = None
@@ -1702,6 +1965,18 @@ class FeishuAdapter(BasePlatformAdapter):
             admins=admins,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
+            outbound_format=_resolve_enum_setting(
+                extra.get("outbound_format"),
+                env_name="HERMES_FEISHU_OUTBOUND_FORMAT",
+                valid=_VALID_OUTBOUND_FORMATS,
+                default="post",
+            ),
+            markdown_table_mode=_resolve_enum_setting(
+                extra.get("markdown_table_mode"),
+                env_name="HERMES_FEISHU_MARKDOWN_TABLE_MODE",
+                valid=_VALID_TABLE_MODES,
+                default="native",
+            ),
             allow_bots=allow_bots,
             require_mention=require_mention,
         )
@@ -1735,6 +2010,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
         self._ws_ping_timeout = settings.ws_ping_timeout
+        self._outbound_format = settings.outbound_format
+        self._markdown_table_mode = settings.markdown_table_mode
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
 
@@ -1901,6 +2178,120 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound — send / edit / send_image / send_voice / …
     # =========================================================================
 
+    def _record_sent_msg_type(self, message_id: str, msg_type: str) -> None:
+        """Remember the msg_type used for *message_id* so edits can pick the
+        right Feishu API surface (patch for cards, update for the rest).
+
+        Reuses the same LRU window as `_sent_message_ids_to_chat` so the cap
+        is naturally enforced — when an entry is evicted from the chat map,
+        we evict the same id from this map below.
+        """
+        if not message_id:
+            return
+        self._sent_msg_types[message_id] = msg_type
+        # Cap to the same LRU as _sent_message_ids_to_chat (the latter is
+        # kept by base.py / connection logic — best-effort sync here).
+        excess = len(self._sent_msg_types) - 4096
+        if excess > 0:
+            for stale in list(self._sent_msg_types.keys())[:excess]:
+                self._sent_msg_types.pop(stale, None)
+
+    def _resolve_edit_msg_type(self, message_id: str, new_msg_type: str) -> str:
+        """Return the msg_type to use when editing *message_id*.
+
+        Feishu rejects patching a non-card message with card content (and
+        vice versa), so we must edit using the same family the message was
+        originally sent under. On cache miss (e.g. process restart between
+        send and edit), fall back to the resolved type for the new content
+        and let the API surface a clean error if the families mismatch — the
+        send/edit fallback will then degrade to plain text.
+        """
+        recorded = self._sent_msg_types.get(message_id)
+        return recorded or new_msg_type
+
+    async def _send_text_fallback(
+        self,
+        *,
+        chunk: str,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+    ) -> Any:
+        return await self._feishu_send_with_retry(
+            chat_id=chat_id,
+            msg_type="text",
+            payload=json.dumps(
+                {"text": _strip_markdown_to_plain_text(chunk)},
+                ensure_ascii=False,
+            ),
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    def _maybe_fallback_to_text_on_exception(
+        self,
+        *,
+        msg_type: str,
+        chunk: str,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        exc: BaseException,
+    ) -> Optional[Any]:
+        """Return an awaitable text-fallback send if the exception matches a
+        known invalid-payload signature for *msg_type*, else None.
+
+        The caller awaits the returned coroutine if non-None; raising the
+        original exception is the caller's responsibility on None.
+        """
+        text = str(exc)
+        if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(text):
+            logger.warning(
+                "[Feishu] Invalid post payload rejected by API; falling back to plain text"
+            )
+        elif msg_type == "interactive" and _CARD_CONTENT_INVALID_RE.search(text):
+            logger.warning(
+                "[Feishu] Invalid card payload rejected by API; falling back to plain text"
+            )
+        else:
+            return None
+        return self._send_text_fallback(
+            chunk=chunk,
+            chat_id=chat_id,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    def _maybe_fallback_to_text_on_response(
+        self,
+        *,
+        msg_type: str,
+        chunk: str,
+        chat_id: str,
+        reply_to: Optional[str],
+        metadata: Optional[Dict[str, Any]],
+        response: Any,
+    ) -> Optional[Any]:
+        if self._response_succeeded(response):
+            return None
+        msg = str(getattr(response, "msg", "") or "")
+        if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(msg):
+            logger.warning(
+                "[Feishu] Post payload rejected by API response; falling back to plain text"
+            )
+        elif msg_type == "interactive" and _CARD_CONTENT_INVALID_RE.search(msg):
+            logger.warning(
+                "[Feishu] Card payload rejected by API response; falling back to plain text"
+            )
+        else:
+            return None
+        return self._send_text_fallback(
+            chunk=chunk,
+            chat_id=chat_id,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -1928,38 +2319,39 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 except Exception as exc:
-                    if msg_type != "post" or not _POST_CONTENT_INVALID_RE.search(str(exc)):
+                    fallback_response = self._maybe_fallback_to_text_on_exception(
+                        msg_type=msg_type,
+                        chunk=chunk,
+                        chat_id=chat_id,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                        exc=exc,
+                    )
+                    if fallback_response is None:
                         raise
-                    logger.warning("[Feishu] Invalid post payload rejected by API; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
-                if (
-                    msg_type == "post"
-                    and not self._response_succeeded(response)
-                    and _POST_CONTENT_INVALID_RE.search(str(getattr(response, "msg", "") or ""))
-                ):
-                    logger.warning("[Feishu] Post payload rejected by API response; falling back to plain text")
-                    response = await self._feishu_send_with_retry(
-                        chat_id=chat_id,
-                        msg_type="text",
-                        payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
-                        reply_to=reply_to,
-                        metadata=metadata,
-                    )
+                    response = await fallback_response
+                fallback_response = self._maybe_fallback_to_text_on_response(
+                    msg_type=msg_type,
+                    chunk=chunk,
+                    chat_id=chat_id,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                    response=response,
+                )
+                if fallback_response is not None:
+                    response = await fallback_response
                 last_response = response
 
             result = self._finalize_send_result(last_response, "send failed")
             if result.success:
+                if result.message_id:
+                    self._record_sent_msg_type(result.message_id, msg_type)
                 logger.info(
-                    "[Feishu] Send succeeded: chat=%s message_id=%s chunks=%d",
+                    "[Feishu] Send succeeded: chat=%s message_id=%s chunks=%d msg_type=%s",
                     chat_id,
                     result.message_id or "",
                     len(chunks),
+                    msg_type,
                 )
             else:
                 logger.warning("[Feishu] Send failed: chat=%s error=%s", chat_id, result.error)
@@ -1976,32 +2368,134 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Edit a previously sent Feishu text/post/card message.
+
+        Cards are edited via `im.v1.message.patch` (body shape: only `content`).
+        Text/post messages continue to use `im.v1.message.update` (body shape:
+        `msg_type` + `content`). Choosing the wrong API surface returns a 400
+        from Feishu, so we look up the original msg_type via
+        `_sent_msg_types`; on cache miss we use the resolved type for the new
+        content and let the rejection fallback degrade to plain text.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
         try:
-            msg_type, payload = self._build_outbound_payload(content)
-            body = self._build_update_message_body(msg_type=msg_type, content=payload)
-            request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
-            result = self._finalize_send_result(response, "update failed")
-            if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
-                logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
-                fallback_body = self._build_update_message_body(
-                    msg_type="text",
-                    content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
+            new_msg_type, payload = self._build_outbound_payload(content)
+            target_msg_type = self._resolve_edit_msg_type(message_id, new_msg_type)
+
+            # If the new content's resolved type does not match the original,
+            # we must downgrade to a compatible type. Feishu permits text→text
+            # and post→text edits via `update`, but never card↔post mixing.
+            # Easiest correct behavior: when families differ, fall through to
+            # plain text via the original family's API.
+            if _is_card_msg_type(target_msg_type) != _is_card_msg_type(new_msg_type):
+                logger.info(
+                    "[Feishu] Edit msg_type mismatch (sent=%s, new=%s); using plain text",
+                    target_msg_type,
+                    new_msg_type,
                 )
-                fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
-                result = self._finalize_send_result(fallback_response, "update failed")
+                response = await self._dispatch_edit_text_fallback(
+                    message_id=message_id,
+                    target_msg_type=target_msg_type,
+                    content=content,
+                )
+                result = self._finalize_send_result(response, "update failed")
+                if result.success:
+                    result.message_id = message_id
+                    self._record_sent_msg_type(message_id, target_msg_type)
+                return result
+
+            response = await self._dispatch_edit(
+                message_id=message_id,
+                msg_type=new_msg_type,
+                payload=payload,
+            )
+            result = self._finalize_send_result(response, "update failed")
+
+            # Symmetric fallback: invalid post / card edit → degrade to text
+            # via the original family's API.
+            if not result.success and self._edit_should_fallback(
+                msg_type=new_msg_type, error=result.error or ""
+            ):
+                response = await self._dispatch_edit_text_fallback(
+                    message_id=message_id,
+                    target_msg_type=new_msg_type,
+                    content=content,
+                )
+                result = self._finalize_send_result(response, "update failed")
+
             if result.success:
                 result.message_id = message_id
+                # Edits don't change the message family on Feishu's side, but
+                # record the latest type so subsequent edits stay consistent.
+                self._record_sent_msg_type(message_id, new_msg_type)
             return result
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def _dispatch_edit(
+        self,
+        *,
+        message_id: str,
+        msg_type: str,
+        payload: str,
+    ) -> Any:
+        if _is_card_msg_type(msg_type):
+            body = self._build_patch_message_body(content=payload)
+            request = self._build_patch_message_request(
+                message_id=message_id, request_body=body
+            )
+            return await asyncio.to_thread(self._client.im.v1.message.patch, request)
+        body = self._build_update_message_body(msg_type=msg_type, content=payload)
+        request = self._build_update_message_request(
+            message_id=message_id, request_body=body
+        )
+        return await asyncio.to_thread(self._client.im.v1.message.update, request)
+
+    async def _dispatch_edit_text_fallback(
+        self,
+        *,
+        message_id: str,
+        target_msg_type: str,
+        content: str,
+    ) -> Any:
+        plain = _strip_markdown_to_plain_text(content)
+        if _is_card_msg_type(target_msg_type):
+            # Cards can only carry card JSON; degrade to a minimal text-only
+            # markdown card so we don't violate the type family.
+            payload = _build_markdown_card_payload(plain)
+            body = self._build_patch_message_body(content=payload)
+            request = self._build_patch_message_request(
+                message_id=message_id, request_body=body
+            )
+            return await asyncio.to_thread(self._client.im.v1.message.patch, request)
+        body = self._build_update_message_body(
+            msg_type="text",
+            content=json.dumps({"text": plain}, ensure_ascii=False),
+        )
+        request = self._build_update_message_request(
+            message_id=message_id, request_body=body
+        )
+        return await asyncio.to_thread(self._client.im.v1.message.update, request)
+
+    @staticmethod
+    def _edit_should_fallback(*, msg_type: str, error: str) -> bool:
+        if _is_card_msg_type(msg_type):
+            if _CARD_CONTENT_INVALID_RE.search(error):
+                logger.warning(
+                    "[Feishu] Invalid card update payload rejected by API; falling back to plain text"
+                )
+                return True
+            return False
+        if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(error):
+            logger.warning(
+                "[Feishu] Invalid post update payload rejected by API; falling back to plain text"
+            )
+            return True
+        return False
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -2277,26 +2771,29 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
 
             if caption:
-                post_payload = self._build_media_post_payload(
-                    caption=caption,
-                    media_tag={"tag": "img", "image_key": image_key},
+                msg_type, payload = self._build_image_caption_payload(
+                    caption=caption, image_key=image_key
                 )
                 message_response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
-                    msg_type="post",
-                    payload=post_payload,
+                    msg_type=msg_type,
+                    payload=payload,
                     reply_to=reply_to,
                     metadata=metadata,
                 )
             else:
+                msg_type = "image"
                 message_response = await self._feishu_send_with_retry(
                     chat_id=chat_id,
-                    msg_type="image",
+                    msg_type=msg_type,
                     payload=json.dumps({"image_key": image_key}, ensure_ascii=False),
                     reply_to=reply_to,
                     metadata=metadata,
                 )
-            return self._finalize_send_result(message_response, "image send failed")
+            result = self._finalize_send_result(message_response, "image send failed")
+            if result.success and result.message_id:
+                self._record_sent_msg_type(result.message_id, msg_type)
+            return result
         except Exception as exc:
             logger.error("[Feishu] Failed to send image %s: %s", image_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -4539,17 +5036,76 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
+    # Threshold above which `auto` mode prefers card over post — long
+    # markdown is more likely to expose post `md` parser quirks (table drops,
+    # code-fence trailing-content swallow), and cards have no length penalty
+    # versus post under typical Feishu render UX.
+    _AUTO_CARD_LENGTH_THRESHOLD = 1500
+
     def _build_outbound_payload(self, content: str) -> tuple[str, str]:
-        # Feishu post-type 'md' elements do not render markdown tables; sending
-        # table content as post causes the message to appear blank on the client.
-        # Force plain text for anything that looks like a markdown table.
-        if _MARKDOWN_TABLE_RE.search(content):
-            text_payload = {"text": content}
-            return "text", json.dumps(text_payload, ensure_ascii=False)
-        if _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
-        text_payload = {"text": content}
-        return "text", json.dumps(text_payload, ensure_ascii=False)
+        # Apply table-mode preprocessing first so heuristics below see the
+        # transformed text. `native`/`off` short-circuit to no-op.
+        prepared = _convert_markdown_tables(content, self._markdown_table_mode)
+        # Bare GFM tables don't match _MARKDOWN_HINT_RE, but they still need
+        # the rich renderer — count them as markdown.
+        is_markdown = bool(_MARKDOWN_HINT_RE.search(prepared)) or _content_has_markdown_table(prepared)
+        if not is_markdown:
+            return "text", json.dumps({"text": prepared}, ensure_ascii=False)
+
+        fmt = self._outbound_format
+        if fmt == "post":
+            return "post", _build_markdown_post_payload(prepared)
+        if fmt == "card":
+            return "interactive", _build_markdown_card_payload(prepared)
+        # "auto": prefer card when post `md` is likely to misrender — i.e.
+        # there's a table, a fenced code block, or the message is long.
+        if (
+            _content_has_markdown_table(prepared)
+            or "```" in prepared
+            or len(prepared) >= self._AUTO_CARD_LENGTH_THRESHOLD
+        ):
+            return "interactive", _build_markdown_card_payload(prepared)
+        return "post", _build_markdown_post_payload(prepared)
+
+    def _build_image_caption_payload(
+        self, *, caption: str, image_key: str
+    ) -> tuple[str, str]:
+        """Build the outbound payload for an image + caption combo.
+
+        Card path when `outbound_format` is `card`, or when `auto` decides
+        the caption needs the richer renderer (table / fence / long). Post
+        path otherwise — equivalent to the legacy behavior, preserving the
+        exact `[md, img]` row layout that `_build_media_post_payload` has
+        always produced.
+        """
+        prepared_caption = _convert_markdown_tables(caption, self._markdown_table_mode)
+
+        fmt = self._outbound_format
+        use_card = fmt == "card"
+        if fmt == "auto":
+            use_card = bool(
+                _MARKDOWN_HINT_RE.search(prepared_caption)
+                and (
+                    _content_has_markdown_table(prepared_caption)
+                    or "```" in prepared_caption
+                    or len(prepared_caption) >= self._AUTO_CARD_LENGTH_THRESHOLD
+                )
+            )
+
+        if use_card:
+            return (
+                "interactive",
+                _build_image_card_payload(
+                    caption=prepared_caption, image_key=image_key
+                ),
+            )
+        return (
+            "post",
+            self._build_media_post_payload(
+                caption=prepared_caption,
+                media_tag={"tag": "img", "image_key": image_key},
+            ),
+        )
 
     async def _send_uploaded_file_message(
         self,
@@ -4836,6 +5392,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 last_error = exc
                 if msg_type == "post" and _POST_CONTENT_INVALID_RE.search(str(exc)):
                     raise
+                if msg_type == "interactive" and _CARD_CONTENT_INVALID_RE.search(str(exc)):
+                    # Skip retry: invalid card payload won't become valid by
+                    # waiting; let the caller's fallback degrade to text.
+                    raise
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
                 wait_seconds = 2 ** attempt
@@ -5005,6 +5565,26 @@ class FeishuAdapter(BasePlatformAdapter):
         if "UpdateMessageRequest" in globals():
             return (
                 UpdateMessageRequest.builder()
+                .message_id(message_id)
+                .request_body(request_body)
+                .build()
+            )
+        return SimpleNamespace(message_id=message_id, request_body=request_body)
+
+    @staticmethod
+    def _build_patch_message_body(*, content: str) -> Any:
+        # Note: PatchMessageRequestBody only exposes `content` — there is no
+        # `msg_type` field. Card edits use this; text/post edits go through
+        # _build_update_message_body.
+        if "PatchMessageRequestBody" in globals():
+            return PatchMessageRequestBody.builder().content(content).build()
+        return SimpleNamespace(content=content)
+
+    @staticmethod
+    def _build_patch_message_request(message_id: str, request_body: Any) -> Any:
+        if "PatchMessageRequest" in globals():
+            return (
+                PatchMessageRequest.builder()
                 .message_id(message_id)
                 .request_body(request_body)
                 .build()
