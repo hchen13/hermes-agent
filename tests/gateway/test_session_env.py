@@ -63,9 +63,8 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
-    assert get_session_env("HERMES_SESSION_USER_ID") == ""
+    assert get_session_env("HERMES_SESSION_ACCOUNT_ID") == ""
     assert get_session_env("HERMES_SESSION_USER_ID_ALT") == ""
-    assert get_session_env("HERMES_SESSION_USER_NAME") == ""
 
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None
