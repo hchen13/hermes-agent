@@ -1951,6 +1951,17 @@ def run_conversation(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
+                # DIAG: surface full traceback for TypeError / unexpected
+                # Python errors that the rest of the recovery path
+                # collapses into a one-line summary. Limit to non-HTTP
+                # exception types so we don't spam logs on routine 429/5xx.
+                if not hasattr(api_error, "status_code") or getattr(api_error, "status_code", None) is None:
+                    logger.warning(
+                        "API call raised non-HTTP %s — full traceback follows",
+                        type(api_error).__name__,
+                        exc_info=True,
+                    )
+
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
                 #   1. Lone surrogates (U+D800..U+DFFF) from clipboard paste

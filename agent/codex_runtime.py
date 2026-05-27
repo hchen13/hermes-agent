@@ -173,6 +173,35 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
     }
 
 
+def _patch_openai_parse_response_for_null_output() -> None:
+    """Tolerate ``response.output is None`` in the openai SDK stream parser."""
+    try:
+        from openai.lib._parsing import _responses as _openai_parsing
+    except Exception:
+        return
+
+    original = getattr(_openai_parsing, "parse_response", None)
+    if original is None or getattr(original, "_hermes_null_output_safe", False):
+        return
+
+    def _safe_parse_response(*args, **kwargs):
+        response = kwargs.get("response")
+        if response is None and args:
+            response = args[-1]
+        if response is not None and getattr(response, "output", "missing") is None:
+            try:
+                response.output = []
+            except Exception:
+                pass
+        return original(*args, **kwargs)
+
+    _safe_parse_response._hermes_null_output_safe = True  # type: ignore[attr-defined]
+    _openai_parsing.parse_response = _safe_parse_response
+
+
+_patch_openai_parse_response_for_null_output()
+
+
 def run_codex_app_server_turn(
     agent,
     *,
