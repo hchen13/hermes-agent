@@ -412,10 +412,14 @@ def _handle_send(args):
             delivery_account_id = getattr(home, "account_id", None) or delivery_account_id
             used_home_channel = True
         else:
+            home_env_var = _HOME_CHANNEL_ENV_OVERRIDES.get(
+                platform_name,
+                f"{platform_name.upper()}_HOME_CHANNEL",
+            )
             return json.dumps({
                 "error": f"No home channel set for {platform_name} to determine where to send the message. "
                 f"Either specify a channel directly with '{platform_name}:CHANNEL_NAME', "
-                f"or set a home channel via: hermes config set {platform_name.upper()}_HOME_CHANNEL <channel_id>"
+                f"or set a home channel via: hermes config set {home_env_var} <channel_id>"
             })
 
     pconfig = _resolve_platform_config(config, platform, account_id=delivery_account_id)

@@ -5554,12 +5554,18 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if isinstance(bot_payload, dict):
             open_id = str(bot_payload.get("open_id") or "").strip()
-            bot_name = str(bot_payload.get("bot_name") or bot_payload.get("name") or "").strip()
+            bot_name = str(
+                bot_payload.get("bot_name")
+                or bot_payload.get("app_name")
+                or bot_payload.get("name")
+                or ""
+            ).strip()
             return (open_id or None, bot_name or None)
 
         open_id = str(getattr(bot_payload, "open_id", "") or "").strip()
         bot_name = str(
             getattr(bot_payload, "bot_name", None)
+            or getattr(bot_payload, "app_name", None)
             or getattr(bot_payload, "name", None)
             or ""
         ).strip()
