@@ -3965,8 +3965,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ``interrupt``). The legacy ``busy_text_mode`` knob is honored only
         when a user explicitly set it, so existing queue setups keep
         working; new installs follow ``busy_input_mode``. Returns one of
-        ``interrupt`` | ``queue`` (``steer`` is handled upstream by
-        ``busy_input_mode`` and maps to non-queue text handling here).
+        ``interrupt`` | ``queue`` | ``steer``. ``steer`` remains accepted as
+        an explicit legacy override and skips text debounce.
         """
         # Legacy explicit override wins for backward compat.
         legacy = os.getenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "").strip().lower()
@@ -3975,6 +3975,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             legacy = str(cfg_get(cfg, "display", "busy_text_mode", default="") or "").strip().lower()
         if legacy == "interrupt":
             return "interrupt"
+        if legacy == "steer":
+            return "steer"
         if legacy == "queue":
             return "queue"
         # No explicit legacy knob → follow busy_input_mode.
@@ -4269,12 +4271,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         effective_mode = self._busy_input_mode
         busy_text_mode = getattr(self, "_busy_text_mode", "interrupt")
-        if (
-            event.message_type == MessageType.TEXT
-            and busy_text_mode == "queue"
-            and effective_mode != "steer"
-        ):
-            return False
+        if event.message_type == MessageType.TEXT:
+            if busy_text_mode == "queue" and effective_mode != "steer":
+                return False
+            if busy_text_mode == "steer":
+                effective_mode = "steer"
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet

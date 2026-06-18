@@ -376,3 +376,10 @@ def test_busy_text_mode_respects_env_var_override(monkeypatch):
     adapter = _make_initialized_adapter()
     assert adapter._busy_text_mode == "interrupt"
     assert not adapter._is_queue_text_debounce_candidate(_make_event("test"))
+
+
+def test_busy_text_mode_accepts_steer_env_var(monkeypatch):
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "steer")
+    adapter = _make_initialized_adapter()
+    assert adapter._busy_text_mode == "steer"
+    assert not adapter._is_queue_text_debounce_candidate(_make_event("test"))
