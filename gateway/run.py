@@ -6314,19 +6314,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if now < info["next_retry"]:
                     continue  # not time yet
 
-                if info["attempts"] >= _MAX_ATTEMPTS:
-                    logger.warning(
-                        "Giving up reconnecting %s after %d attempts",
-                        self._binding_label(platform, account_id), info["attempts"],
-                    )
-                    del self._failed_platforms[raw_binding_key]
-                    continue
-
                 platform_config = info["config"]
                 attempt = info["attempts"] + 1
                 logger.info(
-                    "Reconnecting %s (attempt %d/%d)...",
-                    self._binding_label(platform, account_id), attempt, _MAX_ATTEMPTS,
+                    "Reconnecting %s (attempt %d)...",
+                    self._binding_label(platform, account_id), attempt,
                 )
 
                 adapter = None
