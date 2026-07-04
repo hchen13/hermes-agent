@@ -1518,16 +1518,84 @@ def _strip_edge_self_mentions(
             return remaining
 
 
+# ---------------------------------------------------------------------------
+# Multi-account websocket runtime proxies
+#
+# Multiple Feishu accounts share one Hermes process. Each account runs the
+# official Lark websocket client in its own thread and asyncio loop, but the
+# Lark SDK reads module-global ``loop`` and ``websockets.connect`` symbols.
+# These proxies keep the SDK globals stable while dispatching calls through
+# thread-local state.
+# ---------------------------------------------------------------------------
+
+
+_FEISHU_WS_THREAD_STATE = threading.local()
+
+
+def _current_feishu_ws_loop() -> asyncio.AbstractEventLoop:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    loop = getattr(_FEISHU_WS_THREAD_STATE, "loop", None)
+    if loop is None or bool(getattr(loop, "is_closed", lambda: False)()):
+        raise RuntimeError("Feishu websocket loop is not initialized for this thread")
+    return loop
+
+
+class _FeishuWSLoopProxy:
+    def run_until_complete(self, awaitable: Any) -> Any:
+        loop = getattr(_FEISHU_WS_THREAD_STATE, "loop", None)
+        if loop is None or bool(getattr(loop, "is_closed", lambda: False)()):
+            raise RuntimeError("Feishu websocket thread loop is not available")
+        return loop.run_until_complete(awaitable)
+
+    def create_task(self, coro: Any) -> asyncio.Task[Any]:
+        return _current_feishu_ws_loop().create_task(coro)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(_current_feishu_ws_loop(), name)
+
+
+async def _feishu_ws_connect_proxy(*args: Any, **kwargs: Any) -> Any:
+    connect_impl = getattr(_FEISHU_WS_THREAD_STATE, "original_connect", None)
+    if connect_impl is None:
+        raise RuntimeError("Feishu websocket connect proxy is not initialized")
+    ping_interval = getattr(_FEISHU_WS_THREAD_STATE, "ping_interval", None)
+    ping_timeout = getattr(_FEISHU_WS_THREAD_STATE, "ping_timeout", None)
+    if ping_interval is not None and "ping_interval" not in kwargs:
+        kwargs["ping_interval"] = ping_interval
+    if ping_timeout is not None and "ping_timeout" not in kwargs:
+        kwargs["ping_timeout"] = ping_timeout
+    return await connect_impl(*args, **kwargs)
+
+
+def _install_feishu_ws_runtime_proxies(ws_client_module: Any) -> None:
+    if not getattr(ws_client_module, "_hermes_ws_proxy_installed", False):
+        original_connect = ws_client_module.websockets.connect
+        setattr(ws_client_module, "_hermes_ws_original_connect", original_connect)
+        ws_client_module.websockets.connect = _feishu_ws_connect_proxy
+        ws_client_module.loop = _FeishuWSLoopProxy()
+        setattr(ws_client_module, "_hermes_ws_proxy_installed", True)
+
+
 def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     """Run the official Lark WS client in its own thread-local event loop."""
     import lark_oapi.ws.client as ws_client_module
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    ws_client_module.loop = loop
+    _install_feishu_ws_runtime_proxies(ws_client_module)
+    _FEISHU_WS_THREAD_STATE.loop = loop
+    _FEISHU_WS_THREAD_STATE.original_connect = getattr(
+        ws_client_module,
+        "_hermes_ws_original_connect",
+        ws_client_module.websockets.connect,
+    )
+    _FEISHU_WS_THREAD_STATE.ping_interval = adapter._ws_ping_interval
+    _FEISHU_WS_THREAD_STATE.ping_timeout = adapter._ws_ping_timeout
     adapter._ws_thread_loop = loop
 
-    original_connect = ws_client_module.websockets.connect
     original_configure = getattr(ws_client, "_configure", None)
 
     def _apply_runtime_ws_overrides() -> None:
@@ -1539,13 +1607,6 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         except Exception:
             logger.debug("[Feishu] Failed to apply websocket runtime overrides", exc_info=True)
 
-    def _connect_with_overrides(*args: Any, **kwargs: Any) -> Any:
-        if adapter._ws_ping_interval is not None and "ping_interval" not in kwargs:
-            kwargs["ping_interval"] = adapter._ws_ping_interval
-        if adapter._ws_ping_timeout is not None and "ping_timeout" not in kwargs:
-            kwargs["ping_timeout"] = adapter._ws_ping_timeout
-        return original_connect(*args, **kwargs)
-
     def _configure_with_overrides(conf: Any) -> Any:
         if original_configure is None:
             raise RuntimeError("Feishu _configure_with_overrides called but original_configure is None")
@@ -1553,7 +1614,6 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         _apply_runtime_ws_overrides()
         return result
 
-    ws_client_module.websockets.connect = _connect_with_overrides
     if original_configure is not None:
         setattr(ws_client, "_configure", _configure_with_overrides)
     _apply_runtime_ws_overrides()
@@ -1562,7 +1622,6 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     except Exception:
         pass
     finally:
-        ws_client_module.websockets.connect = original_connect
         if original_configure is not None:
             setattr(ws_client, "_configure", original_configure)
         pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
@@ -1579,6 +1638,9 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         except Exception:
             pass
         adapter._ws_thread_loop = None
+        for attr in ("loop", "original_connect", "ping_interval", "ping_timeout"):
+            if hasattr(_FEISHU_WS_THREAD_STATE, attr):
+                delattr(_FEISHU_WS_THREAD_STATE, attr)
 
 
 def check_feishu_requirements() -> bool:
