@@ -29,12 +29,25 @@ def mirror_to_session(
     source_label: str = "cli",
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    account_id: Optional[str] = None,
+    role: str = "assistant",
 ) -> bool:
     """
     Append a delivery-mirror message to the target session's transcript.
 
     Finds the gateway session that matches the given platform + chat_id,
     then writes a mirror entry to both the JSONL transcript and SQLite DB.
+
+    ``role`` defaults to ``"assistant"`` — correct for the interactive
+    ``send_message`` mirror, where the mirrored text is the agent's own
+    outgoing reply (a genuine assistant turn). Callers mirroring text that is
+    NOT the agent speaking — e.g. a cron brief delivered out-of-band — must
+    pass ``role="user"``: the ``mirror``/``mirror_source`` metadata is dropped
+    at the SQLite boundary (only role+content persist), so on replay an
+    assistant-role mirror is indistinguishable from a real assistant turn and
+    produces ``assistant → assistant`` pairs that break strict-alternation
+    providers (issue #2221). A user-role mirror collapses safely via
+    ``repair_message_sequence``'s consecutive-user merge on every provider.
 
     Returns True if mirrored successfully, False if no matching session or error.
     All errors are caught -- this is never fatal.
@@ -45,6 +58,7 @@ def mirror_to_session(
             str(chat_id),
             thread_id=thread_id,
             user_id=user_id,
+            account_id=account_id,
         )
         if not session_id:
             logger.debug(
@@ -57,7 +71,7 @@ def mirror_to_session(
             return False
 
         mirror_msg = {
-            "role": "assistant",
+            "role": role,
             "content": message_text,
             "timestamp": datetime.now().isoformat(),
             "mirror": True,
@@ -86,6 +100,7 @@ def _find_session_id(
     chat_id: str,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    account_id: Optional[str] = None,
 ) -> Optional[str]:
     """
     Find the active session_id for a platform + chat_id pair.
@@ -111,10 +126,16 @@ def _find_session_id(
     candidates = []
 
     for _key, entry in data.items():
+        # Skip documentation/metadata sentinels (keys starting with "_", e.g.
+        # the gateway's "_README" note) — they are not session entries.
+        if str(_key).startswith("_") or not isinstance(entry, dict):
+            continue
         origin = entry.get("origin") or {}
         entry_platform = (origin.get("platform") or entry.get("platform", "")).lower()
 
         if entry_platform != platform_lower:
+            continue
+        if account_id is not None and str(origin.get("account_id") or "") != str(account_id):
             continue
 
         origin_chat_id = str(origin.get("chat_id", ""))
@@ -137,6 +158,14 @@ def _find_session_id(
         elif len(candidates) > 1:
             return None
     elif len(candidates) > 1:
+        if account_id is None:
+            distinct_account_ids = {
+                str((entry.get("origin") or {}).get("account_id") or "").strip()
+                for entry in candidates
+                if str((entry.get("origin") or {}).get("account_id") or "").strip()
+            }
+            if len(distinct_account_ids) > 1:
+                return None
         distinct_user_ids = {
             str((entry.get("origin") or {}).get("user_id") or "").strip()
             for entry in candidates
