@@ -296,6 +296,13 @@ class GatewayAuthorizationMixin:
             if group_auth is not None:
                 return group_auth
 
+        if source.platform == Platform.FEISHU and source.chat_type not in {"group", "forum", "channel"}:
+            dm_policy = str(extra.get("dm_policy") or "").strip().lower()
+            if dm_policy in {"open", "allow_all"}:
+                return True
+            if dm_policy in {"disabled", "closed", "deny"}:
+                return False
+
         if source.chat_type in {"group", "forum", "channel"}:
             allowed_ids = self._parse_authorized_id_list(
                 extra.get("allowed_group_users")
@@ -320,7 +327,7 @@ class GatewayAuthorizationMixin:
         if self._source_matches_allowed_user(source, admins):
             return True
 
-        groups = extra.get("groups")
+        groups = extra.get("groups") or extra.get("group_rules")
         group_cfg = None
         chat_id = str(source.chat_id or "")
         if isinstance(groups, dict) and chat_id:
