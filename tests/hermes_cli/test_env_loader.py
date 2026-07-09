@@ -19,6 +19,32 @@ def test_user_env_overrides_stale_shell_values(tmp_path, monkeypatch):
     assert os.getenv("OPENAI_BASE_URL") == "https://new.example/v1"
 
 
+def test_profile_env_overrides_root_env_when_profile_is_active(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    profile_home = home / "profiles" / "laok"
+    profile_home.mkdir(parents=True)
+    root_env = home / ".env"
+    profile_env = profile_home / ".env"
+    root_env.write_text(
+        "FEISHU_APP_ID=root-app\nFEISHU_APP_SECRET=root-secret\n",
+        encoding="utf-8",
+    )
+    profile_env.write_text(
+        "FEISHU_APP_ID=profile-app\nFEISHU_APP_SECRET=profile-secret\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_PROFILE", "laok")
+    monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [root_env, profile_env]
+    assert os.getenv("FEISHU_APP_ID") == "profile-app"
+    assert os.getenv("FEISHU_APP_SECRET") == "profile-secret"
+
+
 def test_project_env_overrides_stale_shell_values_when_user_env_missing(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     project_env = tmp_path / ".env"

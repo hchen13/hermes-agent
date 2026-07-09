@@ -177,9 +177,8 @@ class TestFeishuFallbackThreadRouting:
     """Verify FeishuAdapter._send_raw_message routes to topic on fallback."""
 
     @pytest.mark.asyncio
-    async def test_create_uses_thread_id_when_available(self):
-        """When reply_to=None and metadata has thread_id, message.create
-        should use receive_id_type='thread_id'."""
+    async def test_create_rejects_thread_id_receive_id(self):
+        """Feishu message.create does not support receive_id_type='thread_id'."""
         from plugins.platforms.feishu.adapter import FeishuAdapter
 
         # We test the _send_raw_message method directly by mocking the client
@@ -204,40 +203,18 @@ class TestFeishuFallbackThreadRouting:
             return func(*args)
         adapter._run_blocking = _run_blocking_passthrough
 
-        # Call _send_raw_message with reply_to=None and thread_id in metadata
         import json
-        result = await FeishuAdapter._send_raw_message(
-            adapter,
-            chat_id="oc_main_chat",
-            msg_type="text",
-            payload=json.dumps({"text": "hello"}),
-            reply_to=None,
-            metadata={"thread_id": "omt_topic_abc"},
-        )
+        with pytest.raises(ValueError, match="receive_id_type=thread_id"):
+            await FeishuAdapter._send_raw_message(
+                adapter,
+                chat_id="oc_main_chat",
+                msg_type="text",
+                payload=json.dumps({"text": "hello"}),
+                reply_to=None,
+                metadata={"thread_id": "omt_topic_abc"},
+            )
 
-        # Verify message.create was called (not message.reply)
-        mock_client.im.v1.message.create.assert_called_once()
-
-        # The request should have receive_id_type="thread_id"
-        call_args = mock_client.im.v1.message.create.call_args[0][0]
-        # Lark SDK builder exposes .body; the in-tree fallback exposes .request_body.
-        # The contributor's branch had the lark SDK installed, the test environment
-        # may not — handle both shapes.
-        body = getattr(call_args, "body", None) or getattr(call_args, "request_body", None)
-        assert body is not None, "request has neither .body nor .request_body"
-        # receive_id should be the thread_id, not the chat_id
-        receive_id = getattr(body, "receive_id", None)
-        if receive_id is None and isinstance(body, str):
-            import json as _json
-            receive_id = _json.loads(body).get("receive_id")
-        assert receive_id == "omt_topic_abc", (
-            f"Expected receive_id='omt_topic_abc', got '{receive_id}'"
-        )
-        # And receive_id_type must be 'thread_id', not 'chat_id'
-        receive_id_type = getattr(call_args, "receive_id_type", None)
-        assert receive_id_type == "thread_id", (
-            f"Expected receive_id_type='thread_id', got '{receive_id_type}'"
-        )
+        mock_client.im.v1.message.create.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_create_uses_chat_id_when_no_thread(self):

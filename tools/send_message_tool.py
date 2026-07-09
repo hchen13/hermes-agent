@@ -516,15 +516,14 @@ def _handle_send(args):
                 from gateway.mirror import mirror_to_session
                 source_label = get_session_env("HERMES_SESSION_PLATFORM", "cli")
                 user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-                if mirror_to_session(
-                    platform_name,
-                    chat_id,
-                    mirror_text,
-                    source_label=source_label,
-                    thread_id=thread_id,
-                    user_id=user_id,
-                    account_id=delivery_account_id,
-                ):
+                mirror_kwargs = {
+                    "source_label": source_label,
+                    "thread_id": thread_id,
+                    "user_id": user_id,
+                }
+                if delivery_account_id is not None:
+                    mirror_kwargs["account_id"] = delivery_account_id
+                if mirror_to_session(platform_name, chat_id, mirror_text, **mirror_kwargs):
                     result["mirrored"] = True
             except Exception:
                 pass
@@ -646,12 +645,19 @@ def _describe_media_for_mirror(media_files):
 def _get_cron_auto_delivery_target():
     """Return the cron scheduler's auto-delivery target for the current run, if any."""
     from gateway.session_context import get_session_env
-    platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").strip().lower()
-    chat_id = get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "").strip()
+
+    def _cron_delivery_env(name: str) -> str:
+        value = get_session_env(name, "").strip()
+        if value:
+            return value
+        return os.getenv(name, "").strip()
+
+    platform = _cron_delivery_env("HERMES_CRON_AUTO_DELIVER_PLATFORM").lower()
+    chat_id = _cron_delivery_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID")
     if not platform or not chat_id:
         return None
-    thread_id = get_session_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID", "").strip() or None
-    account_id = get_session_env("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID", "").strip() or None
+    thread_id = _cron_delivery_env("HERMES_CRON_AUTO_DELIVER_THREAD_ID") or None
+    account_id = _cron_delivery_env("HERMES_CRON_AUTO_DELIVER_ACCOUNT_ID") or None
     return {
         "platform": platform,
         "chat_id": chat_id,
@@ -671,11 +677,13 @@ def _maybe_skip_cron_duplicate_send(
     if not auto_target:
         return None
 
+    auto_account_id = auto_target.get("account_id") or None
+    requested_account_id = account_id or None
     same_target = (
         auto_target["platform"] == platform_name
         and str(auto_target["chat_id"]) == str(chat_id)
         and auto_target.get("thread_id") == thread_id
-        and (auto_target.get("account_id") or None) == (account_id or None)
+        and (auto_account_id is None or auto_account_id == requested_account_id)
     )
     if not same_target:
         return None
@@ -1782,7 +1790,7 @@ async def _send_qqbot(pconfig, chat_id, message):
             token_data = token_resp.json()
             access_token = token_data.get("access_token")
             if not access_token:
-                return _error(f"QQBot: no access_token in response")
+                return _error("QQBot: no access_token in response")
 
             # Step 2: Send message via REST
             # QQ Bot API has separate endpoints for channels, C2C, and groups.
