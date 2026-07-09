@@ -154,6 +154,7 @@ present (may be `null`); the rest are included only when set.
 | `user_name` | string\|null | yes | Author display name. |
 | `thread_id` | string\|null | yes | Thread/forum-topic id when in a thread. Session-key discriminator. |
 | `chat_topic` | string\|null | yes | Channel topic/description (Discord, Slack). |
+| `account_id` | string | no | Adapter account id when a platform has multiple configured accounts. Session-key discriminator. |
 | `user_id_alt` | string | no | Platform-specific stable alt id (Signal UUID, Feishu union_id). |
 | `chat_id_alt` | string | no | Alternate chat id (e.g. Signal group internal id). |
 | `scope_id` | string | no | Platform-neutral **scope** discriminator: Discord guild / Slack workspace / Matrix server. **REQUIRED for Discord/Slack scope isolation.** Session-key discriminator. (Canonical name as of the D-Q2.5 wire migration.) |

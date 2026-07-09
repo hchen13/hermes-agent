@@ -14696,7 +14696,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return True
 
-    async def _send_restart_notification(self) -> Optional[tuple[str, Optional[str], str, Optional[str]]]:
+    @staticmethod
+    def _notification_delivery_target(
+        platform: Platform,
+        account_id: Optional[str],
+        chat_id: Any,
+        thread_id: Any = None,
+    ) -> tuple:
+        normalized_thread_id = str(thread_id) if thread_id else None
+        if account_id:
+            return (platform.value, str(account_id), str(chat_id), normalized_thread_id)
+        return (platform.value, str(chat_id), normalized_thread_id)
+
+    @staticmethod
+    def _notification_delivery_target_aliases(target: tuple) -> set[tuple]:
+        aliases = {target}
+        if len(target) == 3:
+            platform, chat_id, thread_id = target
+            aliases.add((platform, None, chat_id, thread_id))
+        elif len(target) == 4 and target[1] is None:
+            platform, _account_id, chat_id, thread_id = target
+            aliases.add((platform, chat_id, thread_id))
+        return aliases
+
+    async def _send_restart_notification(self) -> Optional[tuple]:
         """Notify the chat that initiated /restart that the gateway is back."""
         notify_path = _hermes_home / ".restart_notify.json"
         if not notify_path.exists():
@@ -14762,12 +14785,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._binding_label(platform, account_id),
                 chat_id,
             )
-            return (
-                str(platform_str),
-                account_id,
-                str(chat_id),
-                str(thread_id) if thread_id else None,
-            )
+            return self._notification_delivery_target(platform, account_id, chat_id, thread_id)
         except Exception as e:
             logger.warning("Restart notification failed: %s", e)
             return None
@@ -14777,15 +14795,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _send_home_channel_startup_notifications(
         self,
         *,
-        skip_targets: Optional[set[tuple[str, Optional[str], str, Optional[str]]]] = None,
-    ) -> set[tuple[str, Optional[str], str, Optional[str]]]:
+        skip_targets: Optional[set[tuple]] = None,
+    ) -> set[tuple]:
         """Notify configured home channels that the gateway is back online.
 
         The notification is best-effort and sent once per connected platform
         home channel. ``skip_targets`` lets startup avoid duplicate messages
         when a more specific restart notification is queued for the same chat.
         """
-        delivered: set[tuple[str, Optional[str], str, Optional[str]]] = set()
+        delivered: set[tuple] = set()
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
@@ -14803,13 +14821,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 continue
 
-            target = (
-                platform.value,
+            target = self._notification_delivery_target(
+                platform,
                 account_id,
-                str(home.chat_id),
-                str(home.thread_id) if home.thread_id else None,
+                home.chat_id,
+                home.thread_id,
             )
-            if target in skipped or target in delivered:
+            target_aliases = self._notification_delivery_target_aliases(target)
+            if target_aliases & skipped or target in delivered:
                 continue
 
             try:

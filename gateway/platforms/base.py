@@ -2325,7 +2325,12 @@ class BasePlatformAdapter(ABC):
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
-        self.account_id = str((config.extra or {}).get("account_id") or "").strip() or None
+        extra = getattr(config, "extra", None)
+        self.account_id = (
+            str((extra or {}).get("account_id") or "").strip() or None
+            if isinstance(extra, dict)
+            else None
+        )
         self._message_handler: Optional[MessageHandler] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
@@ -5456,7 +5461,7 @@ class BasePlatformAdapter(ABC):
         return SessionSource(
             platform=self.platform,
             chat_id=str(chat_id),
-            account_id=self.account_id,
+            account_id=getattr(self, "account_id", None),
             chat_name=chat_name,
             chat_type=chat_type,
             user_id=str(user_id) if user_id else None,

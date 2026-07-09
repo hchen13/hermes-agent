@@ -907,8 +907,9 @@ def build_session_key(
     ns = _session_key_namespace(profile)
     platform = source.platform.value
     platform_scope = platform
-    if source.account_id:
-        platform_scope = f"{platform}[{source.account_id}]"
+    account_id = getattr(source, "account_id", None)
+    if account_id:
+        platform_scope = f"{platform}[{account_id}]"
     if source.chat_type == "dm":
         dm_chat_id = source.chat_id
         if source.platform == Platform.WHATSAPP:
