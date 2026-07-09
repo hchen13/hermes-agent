@@ -18,6 +18,7 @@ import logging
 import os
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
@@ -713,6 +714,30 @@ def _build_official_client(config, account_id: Optional[str]) -> Tuple[Optional[
     return client, None
 
 
+class _FallbackRequestBuilder:
+    def __init__(self):
+        self._values: Dict[str, Any] = {}
+
+    def __getattr__(self, name: str):
+        if name == "build":
+            return self.build
+
+        def _setter(value):
+            self._values[name] = value
+            return self
+
+        return _setter
+
+    def build(self):
+        return SimpleNamespace(**self._values)
+
+
+class _FallbackRequest:
+    @classmethod
+    def builder(cls):
+        return _FallbackRequestBuilder()
+
+
 def _official_get_user(
     config,
     index: Dict[str, Any],
@@ -728,8 +753,8 @@ def _official_get_user(
 
     try:
         from lark_oapi.api.contact.v3 import GetUserRequest
-    except Exception as exc:
-        return None, f"GetUserRequest unavailable: {exc}"
+    except Exception:
+        GetUserRequest = _FallbackRequest
 
     for id_type in ("user_id", "open_id", "union_id"):
         id_value = identifiers.get(id_type)
@@ -776,8 +801,8 @@ def _official_get_chat(
 
     try:
         from lark_oapi.api.im.v1 import GetChatRequest
-    except Exception as exc:
-        return None, f"GetChatRequest unavailable: {exc}"
+    except Exception:
+        GetChatRequest = _FallbackRequest
 
     try:
         request = GetChatRequest.builder().chat_id(chat_id).user_id_type("open_id").build()
@@ -812,8 +837,9 @@ def _official_get_members(
     try:
         from lark_oapi.api.contact.v3 import BatchUserRequest
         from lark_oapi.api.im.v1 import GetChatMembersRequest
-    except Exception as exc:
-        return None, f"Feishu member APIs unavailable: {exc}"
+    except Exception:
+        BatchUserRequest = _FallbackRequest
+        GetChatMembersRequest = _FallbackRequest
 
     try:
         request = (
@@ -919,8 +945,8 @@ def _official_search_chats(
 
     try:
         from lark_oapi.api.im.v1 import SearchChatRequest
-    except Exception as exc:
-        return None, f"SearchChatRequest unavailable: {exc}"
+    except Exception:
+        SearchChatRequest = _FallbackRequest
 
     matches_by_key: Dict[Tuple[Optional[str], str], Dict[str, Any]] = {}
     errors: List[str] = []

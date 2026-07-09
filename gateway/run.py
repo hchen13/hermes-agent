@@ -8287,7 +8287,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _agent, context="shutdown idle-cache"
                     )
 
-            for raw_binding_key, adapter in self._all_adapter_instances():
+            adapter_instances = getattr(self, "_all_adapter_instances", None)
+            raw_adapter_items = (
+                adapter_instances()
+                if callable(adapter_instances)
+                else list(getattr(self, "adapters", {}).items())
+            )
+            for raw_binding_key, adapter in raw_adapter_items:
                 platform, _account_id = self._normalize_binding_key(raw_binding_key)
                 await self._bounded_adapter_teardown(adapter, platform)
 
@@ -8317,10 +8323,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _task.cancel()
             self._background_tasks.clear()
 
-            self.adapters.clear()
+            if hasattr(self, "adapters"):
+                self.adapters.clear()
             for _session_key in list(self._running_agents):
                 self._release_running_agent_state(_session_key)
-            self._adapters_by_binding.clear()
+            if hasattr(self, "_adapters_by_binding"):
+                self._adapters_by_binding.clear()
             self._running_agents.clear()
             self._running_agents_ts.clear()
             if hasattr(self, "_active_session_leases"):
