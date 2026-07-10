@@ -17498,6 +17498,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
             progress_msg_id = None   # ID of the current progress message to edit
             can_edit = progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
+            progress_suppressed = False
+            suppress_progress_after_edit_failure = source.platform == Platform.FEISHU
             _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
@@ -17608,7 +17610,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 Returns True when it delivered/split the current buffer and the
                 caller should skip the normal send/edit path for this tick.
                 """
-                nonlocal progress_msg_id, progress_lines, can_edit
+                nonlocal progress_msg_id, progress_lines, can_edit, progress_suppressed
                 if not progress_lines or not can_edit:
                     return False
                 groups = _split_progress_groups(progress_lines)
@@ -17619,6 +17621,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if progress_msg_id is not None:
                     result = await _edit_progress_message(progress_msg_id, first_text)
                     if not result.success:
+                        if suppress_progress_after_edit_failure:
+                            progress_suppressed = True
+                            progress_lines = []
+                            logger.info(
+                                "[%s] Suppressing remaining tool progress after edit failure",
+                                adapter.name,
+                            )
+                            return True
                         can_edit = False
                         # Fall back to the existing non-edit behavior below.
                         return False
@@ -17665,6 +17675,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             continue
                     except Exception:
                         pass
+
+                    if progress_suppressed:
+                        continue
 
                     # Handle dedup messages: update last line with repeat counter
                     if isinstance(raw, tuple) and len(raw) == 3 and raw[0] == "__dedup__":
@@ -17738,6 +17751,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     adapter.name,
                                 )
                                 _last_edit_ts = time.monotonic()
+                                continue
+                            if suppress_progress_after_edit_failure:
+                                progress_suppressed = True
+                                progress_lines = []
+                                logger.info(
+                                    "[%s] Suppressing remaining tool progress after edit failure",
+                                    adapter.name,
+                                )
                                 continue
                             else:
                                 can_edit = False
@@ -18066,6 +18087,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             transport=_scfg.transport or "edit",
                             chat_type=getattr(source, "chat_type", "") or "",
                         )
+                        _reset_progress_on_content_message = source.platform != Platform.FEISHU
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
                             chat_id=source.chat_id,
@@ -18073,7 +18095,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             metadata=_status_thread_metadata,
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
-                                if progress_queue is not None
+                                if progress_queue is not None and _reset_progress_on_content_message
                                 else None
                             ),
                             on_before_finalize=_pause_typing_before_finalize,

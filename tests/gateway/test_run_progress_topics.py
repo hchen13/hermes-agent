@@ -147,6 +147,23 @@ class FirstEditFailsAdapter(ProgressCaptureAdapter):
         return SendResult(success=True, message_id=message_id)
 
 
+class PermanentEditFailsAdapter(ProgressCaptureAdapter):
+    def __init__(self, platform=Platform.TELEGRAM):
+        super().__init__(platform=platform)
+        self.edit_attempts = 0
+
+    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+        self.edit_attempts += 1
+        self.edits.append(
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "content": content,
+            }
+        )
+        return SendResult(success=False, error="message not found")
+
+
 class FakeAgent:
     def __init__(self, **kwargs):
         # Capture anything passed via kwargs (older code path) but don't
@@ -265,6 +282,30 @@ class SpacedProgressAgent:
         time.sleep(1.7)
         self.tool_progress_callback("tool.started", "terminal", "second command", {})
         time.sleep(1.7)
+        self.tool_progress_callback("tool.started", "terminal", "third command", {})
+        time.sleep(0.2)
+        return {
+            "final_response": "done",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
+class InterleavedProgressAndCommentaryAgent:
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        self.tool_progress_callback("tool.started", "terminal", "first command", {})
+        time.sleep(1.7)
+        self.interim_assistant_callback("I found the first issue.")
+        time.sleep(0.35)
+        self.tool_progress_callback("tool.started", "terminal", "second command", {})
+        time.sleep(1.7)
+        self.interim_assistant_callback("Checking another path.")
+        time.sleep(0.35)
         self.tool_progress_callback("tool.started", "terminal", "third command", {})
         time.sleep(0.2)
         return {
@@ -895,6 +936,56 @@ async def test_tool_progress_does_not_create_new_bubbles_after_transient_edit_fa
     progress_sends = [call for call in adapter.sent if "command" in call["content"]]
     assert len(progress_sends) == 1
     assert "first command" in progress_sends[0]["content"]
+    assert adapter.edit_attempts >= 1
+
+
+@pytest.mark.asyncio
+async def test_feishu_tool_progress_keeps_one_bubble_across_interim_commentary(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        InterleavedProgressAndCommentaryAgent,
+        session_id="sess-feishu-progress-commentary",
+        config_data={"display": {"tool_progress": "all", "interim_assistant_messages": True}},
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="dm",
+        thread_id=None,
+    )
+
+    assert result["final_response"] == "done"
+    progress_sends = [call for call in adapter.sent if "command" in call["content"]]
+    assert len(progress_sends) == 1
+    assert "first command" in progress_sends[0]["content"]
+    assert any("second command" in call["content"] for call in adapter.edits)
+    assert any("third command" in call["content"] for call in adapter.edits)
+
+
+@pytest.mark.asyncio
+async def test_feishu_tool_progress_suppresses_after_permanent_edit_failure(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        SpacedProgressAgent,
+        session_id="sess-feishu-progress-permanent-edit-failure",
+        config_data={"display": {"tool_progress": "all"}},
+        platform=Platform.FEISHU,
+        chat_id="oc_chat",
+        chat_type="dm",
+        thread_id=None,
+        adapter_cls=PermanentEditFailsAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    progress_sends = [call for call in adapter.sent if "command" in call["content"]]
+    assert len(progress_sends) == 1
+    assert "first command" in progress_sends[0]["content"]
+    assert all("second command" not in call["content"] for call in progress_sends)
+    assert all("third command" not in call["content"] for call in progress_sends)
     assert adapter.edit_attempts >= 1
 
 
