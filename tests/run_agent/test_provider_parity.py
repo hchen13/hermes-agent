@@ -400,6 +400,24 @@ class TestBuildApiKwargsChatCompletionsServiceTier:
         assert "service_tier" not in kwargs
 
 
+class TestBuildApiKwargsChatCompletionsVerbosity:
+    def test_includes_verbosity_for_gpt5(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "gpt-5.6-sol"
+        agent.request_overrides = {"text_verbosity": "low"}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["verbosity"] == "low"
+        assert "text_verbosity" not in kwargs
+
+    def test_ignores_text_verbosity_for_unsupported_models(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.model = "gpt-4.1"
+        agent.request_overrides = {"text_verbosity": "low"}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert "verbosity" not in kwargs
+        assert "text_verbosity" not in kwargs
+
+
 class TestBuildApiKwargsKimiNoTemperatureOverride:
     def test_kimi_for_coding_omits_temperature(self, monkeypatch):
         """Temperature should NOT be set client-side for Kimi models.
@@ -429,7 +447,7 @@ class TestBuildApiKwargsNousPortal:
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         extra = kwargs.get("extra_body", {})
-        assert extra.get("tags") == nous_portal_tags()
+        assert extra.get("tags") == nous_portal_tags(session_id=agent.session_id)
 
     def test_uses_chat_completions_format(self, monkeypatch):
         agent = _make_agent(
@@ -534,6 +552,19 @@ class TestBuildApiKwargsCodex:
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["service_tier"] == "priority"
+
+    def test_includes_text_verbosity_via_request_overrides(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "openai-codex",
+            api_mode="codex_responses",
+            base_url="https://chatgpt.com/backend-api/codex",
+        )
+        agent.model = "gpt-5.6-sol"
+        agent.request_overrides = {"text_verbosity": "low"}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["text"] == {"verbosity": "low"}
+        assert "text_verbosity" not in kwargs
 
     def test_omits_max_output_tokens_for_codex_backend(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",

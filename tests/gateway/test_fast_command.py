@@ -59,6 +59,7 @@ def _make_runner():
     runner._prefill_messages = []
     runner._reasoning_config = None
     runner._service_tier = None
+    runner._text_verbosity = None
     runner._provider_routing = {}
     runner._fallback_model = None
     runner._running_agents = {}
@@ -142,8 +143,32 @@ def test_turn_route_skips_priority_processing_for_unsupported_models():
     assert route["request_overrides"] == {}
 
 
+def test_turn_route_injects_text_verbosity_for_supported_models():
+    runner = _make_runner()
+    runner._text_verbosity = "low"
+    runtime_kwargs = {
+        "api_key": "***",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "provider": "openai-codex",
+        "api_mode": "codex_responses",
+        "command": None,
+        "args": [],
+        "credential_pool": None,
+    }
+
+    route = gateway_run.GatewayRunner._resolve_turn_agent_config(
+        runner,
+        "hi",
+        "gpt-5.6-sol",
+        runtime_kwargs,
+    )
+
+    assert route["request_overrides"] == {"text_verbosity": "low"}
+
+
 @pytest.mark.asyncio
-async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
+async def test_handle_fast_command_session_scoped_by_default(monkeypatch, tmp_path):
+    """Bare /fast fast applies a session override — config.yaml untouched."""
     runner = _make_runner()
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -154,9 +179,55 @@ async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
 
     assert "FAST" in response
     assert runner._service_tier == "priority"
+    # Session override recorded; config.yaml NOT written.
+    assert runner._session_service_tier_overrides
+    assert not (tmp_path / "config.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+
+    response = await runner._handle_fast_command(_make_event("/fast fast --global"))
+
+    assert "FAST" in response
+    assert runner._service_tier == "priority"
 
     saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert saved["agent"]["service_tier"] == "fast"
+    # Global write supersedes the session override.
+    assert not runner._session_service_tier_overrides
+
+
+@pytest.mark.asyncio
+async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path):
+    """A session /fast normal wins over agent.service_tier: fast in config."""
+    runner = _make_runner()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        gateway_run,
+        "_load_gateway_runtime_config",
+        lambda: {"agent": {"service_tier": "fast"}},
+    )
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+
+    event = _make_event("/fast normal")
+    session_key = runner._session_key_for_source(event.source)
+
+    response = await runner._handle_fast_command(event)
+
+    assert "NORMAL" in response
+    # Override stores explicit None (normal) and wins over config "fast".
+    assert session_key in runner._session_service_tier_overrides
+    assert runner._resolve_session_service_tier(session_key=session_key) is None
+    # A different session still gets the config default.
+    assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
 
 
 @pytest.mark.asyncio
@@ -164,7 +235,10 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     _install_fake_agent(monkeypatch)
     runner = _make_runner()
 
-    (tmp_path / "config.yaml").write_text("agent:\n  service_tier: fast\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "agent:\n  service_tier: fast\n  text_verbosity: low\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
     monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
@@ -176,7 +250,7 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     monkeypatch.setattr(
         gateway_run,
         "_load_gateway_runtime_config",
-        lambda: {"agent": {"service_tier": "fast"}},
+        lambda: {"agent": {"service_tier": "fast", "text_verbosity": "low"}},
     )
     monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
     monkeypatch.setattr(
@@ -205,7 +279,10 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
 
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
-    assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+    assert _CapturingAgent.last_init["request_overrides"] == {
+        "service_tier": "priority",
+        "text_verbosity": "low",
+    }
 
 
 @pytest.mark.asyncio

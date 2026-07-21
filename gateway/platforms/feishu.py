@@ -12,4 +12,3 @@ from plugins.platforms.feishu.adapter import *  # noqa: F401,F403
 
 def __getattr__(name):
     return getattr(_adapter, name)
-

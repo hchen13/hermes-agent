@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from unittest.mock import patch
 
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource
+from gateway.session_context import clear_session_vars, set_session_vars
 from tools.feishu_id_tool import feishu_id_tool
 
 
@@ -126,6 +128,15 @@ def _make_config(accounts: dict[str, dict], default_account: str | None = None):
         get_connected_platforms=lambda: {Platform.FEISHU},
         platforms={Platform.FEISHU: next(iter(configs.values())) if configs else None},
     )
+
+
+@contextmanager
+def _active_session(**kwargs):
+    tokens = set_session_vars(**kwargs)
+    try:
+        yield
+    finally:
+        clear_session_vars(tokens)
 
 
 class TestFeishuIdTool:
@@ -457,11 +468,6 @@ class TestFeishuIdTool:
 
     def test_my_chats_uses_current_sender_context(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
-        monkeypatch.setenv("HERMES_SESSION_ACCOUNT_ID", "laok-personal")
-        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_ethan")
-        monkeypatch.setenv("HERMES_SESSION_USER_ID_ALT", "on_ethan")
-        monkeypatch.setenv("HERMES_SESSION_USER_NAME", "Ethan")
         _write_sessions(
             tmp_path,
             [
@@ -500,7 +506,16 @@ class TestFeishuIdTool:
             default_account="laok-personal",
         )
 
-        with patch("gateway.config.load_gateway_config", return_value=config):
+        with (
+            _active_session(
+                platform="feishu",
+                account_id="laok-personal",
+                user_id="ou_ethan",
+                user_id_alt="on_ethan",
+                user_name="Ethan",
+            ),
+            patch("gateway.config.load_gateway_config", return_value=config),
+        ):
             result = json.loads(feishu_id_tool({"action": "my_chats"}))
 
         assert result["success"] is True
@@ -509,9 +524,6 @@ class TestFeishuIdTool:
 
     def test_cross_account_query_denied_for_non_admin_feishu_session(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
-        monkeypatch.setenv("HERMES_SESSION_ACCOUNT_ID", "laok-personal")
-        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_viewer")
         _write_sessions(tmp_path, [])
         config = _make_config(
             {
@@ -521,7 +533,14 @@ class TestFeishuIdTool:
             default_account="laok-personal",
         )
 
-        with patch("gateway.config.load_gateway_config", return_value=config):
+        with (
+            _active_session(
+                platform="feishu",
+                account_id="laok-personal",
+                user_id="ou_viewer",
+            ),
+            patch("gateway.config.load_gateway_config", return_value=config),
+        ):
             result = json.loads(
                 feishu_id_tool(
                     {
@@ -537,9 +556,6 @@ class TestFeishuIdTool:
 
     def test_cross_account_query_allowed_for_admin_and_scoped_to_requested_account(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
-        monkeypatch.setenv("HERMES_SESSION_ACCOUNT_ID", "laok-personal")
-        monkeypatch.setenv("HERMES_SESSION_USER_ID", "u_owner")
         _write_sessions(tmp_path, [])
         config = _make_config(
             {
@@ -586,6 +602,11 @@ class TestFeishuIdTool:
             return clients[account_id], None
 
         with (
+            _active_session(
+                platform="feishu",
+                account_id="laok-personal",
+                user_id="u_owner",
+            ),
             patch("gateway.config.load_gateway_config", return_value=config),
             patch("tools.feishu_id_tool._build_official_client", side_effect=_build_client),
         ):

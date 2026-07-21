@@ -35,6 +35,25 @@ class TestParseServiceTierConfig(unittest.TestCase):
         self.assertIsNone(self._parse(""))
 
 
+class TestParseTextVerbosityConfig(unittest.TestCase):
+    def _parse(self, raw):
+        cli_mod = _import_cli()
+        return cli_mod._parse_text_verbosity_config(raw)
+
+    def test_accepts_supported_values(self):
+        self.assertEqual(self._parse("low"), "low")
+        self.assertEqual(self._parse("medium"), "medium")
+        self.assertEqual(self._parse("high"), "high")
+
+    def test_empty_and_default_map_to_low(self):
+        self.assertEqual(self._parse("default"), "low")
+        self.assertEqual(self._parse(""), "low")
+
+    def test_off_disables_text_verbosity(self):
+        self.assertIsNone(self._parse("off"))
+        self.assertIsNone(self._parse("none"))
+
+
 class TestHandleFastCommand(unittest.TestCase):
     def _make_cli(self, service_tier=None):
         return SimpleNamespace(
@@ -82,6 +101,20 @@ class TestHandleFastCommand(unittest.TestCase):
             patch.object(cli_mod, "save_config_value", return_value=True) as mock_save,
         ):
             cli_mod.HermesCLI._handle_fast_command(stub, "/fast normal")
+
+        # Session-scoped by default: no config write.
+        mock_save.assert_not_called()
+        self.assertIsNone(stub.service_tier)
+        self.assertIsNone(stub.agent)
+
+    def test_global_flag_persists_service_tier(self):
+        cli_mod = _import_cli()
+        stub = self._make_cli(service_tier="priority")
+        with (
+            patch.object(cli_mod, "_cprint"),
+            patch.object(cli_mod, "save_config_value", return_value=True) as mock_save,
+        ):
+            cli_mod.HermesCLI._handle_fast_command(stub, "/fast normal --global")
 
         mock_save.assert_called_once_with("agent.service_tier", "normal")
         self.assertIsNone(stub.service_tier)
@@ -201,6 +234,35 @@ class TestPriorityProcessingModels(unittest.TestCase):
         assert resolve_fast_mode_overrides("kimi-k2-thinking") is None
 
 
+class TestTextVerbosityModels(unittest.TestCase):
+    def test_gpt5_models_supported(self):
+        from hermes_cli.models import model_supports_text_verbosity
+
+        assert model_supports_text_verbosity("gpt-5.6-sol") is True
+        assert model_supports_text_verbosity("openai/gpt-5.4-mini") is True
+        assert model_supports_text_verbosity("gpt-5-chat-latest") is True
+
+    def test_codex_and_non_gpt5_models_rejected(self):
+        from hermes_cli.models import model_supports_text_verbosity
+
+        assert model_supports_text_verbosity("gpt-5-codex") is False
+        assert model_supports_text_verbosity("gpt-5.3-codex") is False
+        assert model_supports_text_verbosity("gpt-4.1") is False
+
+    def test_resolve_combined_overrides(self):
+        from hermes_cli.models import resolve_model_request_overrides
+
+        assert resolve_model_request_overrides(
+            "gpt-5.6-sol",
+            service_tier="priority",
+            text_verbosity="low",
+        ) == {"service_tier": "priority", "text_verbosity": "low"}
+        assert resolve_model_request_overrides(
+            "gpt-5.3-codex",
+            text_verbosity="low",
+        ) is None
+
+
 class TestFastModeRouting(unittest.TestCase):
     def test_fast_command_exposed_for_model_even_when_provider_is_auto(self):
         cli_mod = _import_cli()
@@ -257,6 +319,25 @@ class TestFastModeRouting(unittest.TestCase):
 
         assert route["runtime"]["provider"] == "openrouter"
         assert route.get("request_overrides") is None
+
+    def test_turn_route_injects_text_verbosity_for_supported_models(self):
+        cli_mod = _import_cli()
+        stub = SimpleNamespace(
+            model="gpt-5.6-sol",
+            api_key="primary-key",
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider="openai-codex",
+            api_mode="codex_responses",
+            acp_command=None,
+            acp_args=[],
+            _credential_pool=None,
+            service_tier=None,
+            text_verbosity="low",
+        )
+
+        route = cli_mod.HermesCLI._resolve_turn_agent_config(stub, "hi")
+
+        assert route["request_overrides"] == {"text_verbosity": "low"}
 
 
 class TestAnthropicFastMode(unittest.TestCase):
@@ -483,3 +564,5 @@ class TestConfigDefault(unittest.TestCase):
         agent = DEFAULT_CONFIG.get("agent", {})
         self.assertIn("service_tier", agent)
         self.assertEqual(agent["service_tier"], "")
+        self.assertIn("text_verbosity", agent)
+        self.assertEqual(agent["text_verbosity"], "low")

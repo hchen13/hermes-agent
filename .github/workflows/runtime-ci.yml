@@ -51,15 +51,23 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pytest \
+            tests/gateway/test_platform_reconnect.py \
+            tests/gateway/test_platform_reconnect_fd_leak.py \
             tests/gateway/test_feishu_ws_runtime.py \
             tests/gateway/test_feishu.py \
+            tests/gateway/test_sethome_multi_account.py \
             tests/gateway/test_unauthorized_dm_behavior.py \
             tests/gateway/test_run_progress_topics.py \
+            tests/gateway/test_active_session_text_merge.py \
+            tests/gateway/test_config.py \
+            tests/cron/test_scheduler.py \
             tests/run_agent/test_compression_feasibility.py \
             tests/cli/test_fast_command.py \
             tests/gateway/test_fast_command.py \
+            tests/run_agent/test_provider_parity.py \
             tests/run_agent/test_run_agent_codex_responses.py \
             tests/tools/test_feishu_id_tool.py \
+            tests/tools/test_send_message_tool.py \
             -q --tb=short
         env:
           # Ensure tests don't accidentally call real APIs.
