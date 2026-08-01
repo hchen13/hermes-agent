@@ -2838,7 +2838,7 @@ class GatewaySlashCommandsMixin:
 
     async def _handle_set_home_command(self, event: MessageEvent) -> str:
         """Handle /sethome command -- set the current chat as the platform's home channel."""
-        from gateway.run import _home_target_env_var, _home_thread_env_var
+        from gateway.run import _hermes_home, _home_target_env_var, _home_thread_env_var
         source = event.source
         platform_name = source.platform.value if source.platform else "unknown"
         chat_id = source.chat_id
@@ -2888,7 +2888,11 @@ class GatewaySlashCommandsMixin:
         # config.yaml is canonical because it can persist the authenticated
         # logical-target provenance required by Relay after a restart.
         try:
-            persist_home_channel(home, enabled_if_new=not via_relay)
+            persist_home_channel(
+                home,
+                enabled_if_new=not via_relay,
+                hermes_home=_hermes_home,
+            )
         except Exception as e:
             return t("gateway.set_home.save_failed", error=e)
 

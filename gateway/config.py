@@ -467,29 +467,40 @@ class HomeChannel:
         )
 
 
-def persist_home_channel(home: HomeChannel, *, enabled_if_new: bool = False) -> None:
+def persist_home_channel(
+    home: HomeChannel,
+    *,
+    enabled_if_new: bool = False,
+    hermes_home: Optional[Path] = None,
+) -> None:
     """Persist a logical home without falsely enabling a Relay-fronted adapter."""
     from hermes_cli.config import load_config, save_config
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    config = load_config()
-    platforms = config.setdefault("platforms", {})
-    if not isinstance(platforms, dict):
-        platforms = {}
-        config["platforms"] = platforms
-    platform_config = platforms.setdefault(home.platform.value, {})
-    if not isinstance(platform_config, dict):
-        platform_config = {}
-        platforms[home.platform.value] = platform_config
-    if enabled_if_new:
-        platform_config.setdefault("enabled", True)
-    platform_config["home_channel"] = home.to_dict()
-    if home.platform == Platform.FEISHU and home.account_id:
-        accounts = platform_config.get("accounts", {})
-        if isinstance(accounts, dict):
-            for account_config in accounts.values():
-                if isinstance(account_config, dict):
-                    account_config.pop("home_channel", None)
-    save_config(config)
+    home_token = set_hermes_home_override(hermes_home) if hermes_home else None
+    try:
+        config = load_config()
+        platforms = config.setdefault("platforms", {})
+        if not isinstance(platforms, dict):
+            platforms = {}
+            config["platforms"] = platforms
+        platform_config = platforms.setdefault(home.platform.value, {})
+        if not isinstance(platform_config, dict):
+            platform_config = {}
+            platforms[home.platform.value] = platform_config
+        if enabled_if_new:
+            platform_config.setdefault("enabled", True)
+        platform_config["home_channel"] = home.to_dict()
+        if home.platform == Platform.FEISHU and home.account_id:
+            accounts = platform_config.get("accounts", {})
+            if isinstance(accounts, dict):
+                for account_config in accounts.values():
+                    if isinstance(account_config, dict):
+                        account_config.pop("home_channel", None)
+        save_config(config)
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 @dataclass

@@ -13629,6 +13629,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "help": self._handle_help_command,
                 "commands": self._handle_commands_command,
                 "profile": self._handle_profile_command,
+                "sethome": self._handle_set_home_command,
                 "update": self._handle_update_command,
                 "version": self._handle_version_command,
             }.get(name)
