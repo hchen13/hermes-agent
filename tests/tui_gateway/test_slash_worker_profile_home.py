@@ -35,6 +35,7 @@ def test_slash_worker_accepts_profile_home():
             assert call_kwargs["env"]["HERMES_HOME"] == "/home/luke/.hermes/profiles/work"
 
 
+
 def test_slash_worker_without_profile_home():
     """_SlashWorker works without profile_home parameter (backward compatible)."""
     with patch.dict("sys.modules", {

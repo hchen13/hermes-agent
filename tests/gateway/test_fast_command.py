@@ -125,6 +125,7 @@ def test_turn_route_injects_priority_processing_without_changing_runtime():
     assert route["request_overrides"] == {"service_tier": "priority"}
 
 
+
 def test_turn_route_skips_priority_processing_for_unsupported_models():
     runner = _make_runner()
     runner._service_tier = "priority"
@@ -182,8 +183,6 @@ async def test_handle_fast_command_session_scoped_by_default(monkeypatch, tmp_pa
     # Session override recorded; config.yaml NOT written.
     assert runner._session_service_tier_overrides
     assert not (tmp_path / "config.yaml").exists()
-
-
 @pytest.mark.asyncio
 async def test_handle_fast_command_global_flag_persists_config(monkeypatch, tmp_path):
     runner = _make_runner()
@@ -228,6 +227,7 @@ async def test_session_fast_override_beats_config_default(monkeypatch, tmp_path)
     assert runner._resolve_session_service_tier(session_key=session_key) is None
     # A different session still gets the config default.
     assert runner._resolve_session_service_tier(session_key="other-session") == "priority"
+
 
 
 @pytest.mark.asyncio
