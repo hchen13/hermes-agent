@@ -10,10 +10,9 @@ name: Nix flake check
 # in progress. One slow advisory job in the CI lane blocks every rerun of the
 # fast required jobs beside it. A separate run reruns and cancels on its own.
 
+# Nix is advisory for this runtime fork and remains available on demand.
 on:
-  pull_request:
-  push:
-    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
