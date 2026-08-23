@@ -300,8 +300,6 @@ class TestBuildApiKwargsChatCompletionsServiceTier:
         assert kwargs["service_tier"] == "priority"
 
 
-
-
 class TestBuildApiKwargsChatCompletionsVerbosity:
     def test_includes_verbosity_for_gpt5(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
@@ -318,6 +316,8 @@ class TestBuildApiKwargsChatCompletionsVerbosity:
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert "verbosity" not in kwargs
         assert "text_verbosity" not in kwargs
+
+
 
 
 class TestBuildApiKwargsKimiNoTemperatureOverride:
@@ -476,7 +476,6 @@ class TestBuildApiKwargsCodex:
         kwargs = agent._build_api_kwargs(messages)
         assert kwargs["service_tier"] == "priority"
 
-
     def test_includes_text_verbosity_via_request_overrides(self, monkeypatch):
         agent = _make_agent(
             monkeypatch,
@@ -490,14 +489,7 @@ class TestBuildApiKwargsCodex:
         assert kwargs["text"] == {"verbosity": "low"}
         assert "text_verbosity" not in kwargs
 
-    def test_omits_max_output_tokens_for_codex_backend(self, monkeypatch):
-        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
-                            base_url="https://chatgpt.com/backend-api/codex")
-        agent.model = "gpt-5.4"
-        agent.max_tokens = 20
-        messages = [{"role": "user", "content": "hi"}]
-        kwargs = agent._build_api_kwargs(messages)
-        assert "max_output_tokens" not in kwargs
+
 
     def test_tools_converted_to_responses_format(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",

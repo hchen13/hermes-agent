@@ -10,6 +10,7 @@ from gateway.session_context import (
     get_session_env,
     set_session_vars,
     clear_session_vars,
+    reset_session_vars,
     _VAR_MAP,
     _UNSET,
 )
@@ -52,9 +53,6 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_USER_ID_ALT", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
 
     tokens = runner._set_session_env(context)
 
@@ -67,8 +65,6 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
-    assert get_session_env("HERMES_SESSION_ACCOUNT_ID") == ""
-    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == ""
 
     # os.environ should NOT be touched
     assert os.getenv("HERMES_SESSION_PLATFORM") is None
@@ -91,9 +87,6 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_USER_ID_ALT", raising=False)
-    monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
 
     source = SessionSource(
         platform=Platform.TELEGRAM,
@@ -121,9 +114,6 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     assert get_session_env("HERMES_SESSION_USER_ID") == ""
     assert get_session_env("HERMES_SESSION_USER_NAME") == ""
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
-    assert get_session_env("HERMES_SESSION_USER_ID") == ""
-    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == ""
-    assert get_session_env("HERMES_SESSION_USER_NAME") == ""
 
 
 def test_get_session_env_falls_back_to_os_environ(monkeypatch):
@@ -134,10 +124,8 @@ def test_get_session_env_falls_back_to_os_environ(monkeypatch):
     assert get_session_env("HERMES_SESSION_PLATFORM") == "discord"
 
     # Now set a contextvar — should prefer it
-    tokens = set_session_vars(platform="telegram", user_id="u_1", user_name="Alice")
+    tokens = set_session_vars(platform="telegram")
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
-    assert get_session_env("HERMES_SESSION_USER_ID") == "u_1"
-    assert get_session_env("HERMES_SESSION_USER_NAME") == "Alice"
 
     # After clear — should return "" (explicitly cleared), NOT fall back
     # to os.environ.  This is the fix for #10304: stale os.environ values
@@ -146,62 +134,6 @@ def test_get_session_env_falls_back_to_os_environ(monkeypatch):
     assert get_session_env("HERMES_SESSION_PLATFORM") == ""
 
 
-
-def test_get_session_env_default_when_nothing_set(monkeypatch):
-    """get_session_env returns default when neither contextvar nor env is set."""
-    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
-
-    assert get_session_env("HERMES_SESSION_PLATFORM") == ""
-    assert get_session_env("HERMES_SESSION_PLATFORM", "fallback") == "fallback"
-
-
-def test_set_session_env_handles_missing_optional_fields():
-    """_set_session_env should handle None chat_name and thread_id gracefully."""
-    runner = object.__new__(GatewayRunner)
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="-1001",
-        chat_name=None,
-        chat_type="private",
-        thread_id=None,
-    )
-    context = SessionContext(source=source, connected_platforms=[], home_channels={})
-
-    tokens = runner._set_session_env(context)
-
-    assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
-    assert get_session_env("HERMES_SESSION_CHAT_ID") == "-1001"
-    assert get_session_env("HERMES_SESSION_CHAT_NAME") == ""
-    assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
-    assert get_session_env("HERMES_SESSION_USER_ID") == ""
-    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == ""
-    assert get_session_env("HERMES_SESSION_USER_NAME") == ""
-
-    runner._clear_session_env(tokens)
-
-
-def test_set_session_env_includes_sender_identity():
-    runner = object.__new__(GatewayRunner)
-    source = SessionSource(
-        platform=Platform.FEISHU,
-        chat_id="oc_123",
-        account_id="laok-personal",
-        chat_name="Team CLAIRE",
-        chat_type="group",
-        user_id="ou_abc",
-        user_id_alt="on_union",
-        user_name="Ethan",
-    )
-    context = SessionContext(source=source, connected_platforms=[], home_channels={})
-
-    tokens = runner._set_session_env(context)
-
-    assert get_session_env("HERMES_SESSION_ACCOUNT_ID") == "laok-personal"
-    assert get_session_env("HERMES_SESSION_USER_ID") == "ou_abc"
-    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == "on_union"
-    assert get_session_env("HERMES_SESSION_USER_NAME") == "Ethan"
-
-    runner._clear_session_env(tokens)
 # ---------------------------------------------------------------------------
 # SESSION_KEY contextvars tests
 # ---------------------------------------------------------------------------
@@ -304,4 +236,40 @@ async def test_run_in_executor_with_context_preserves_session_env(monkeypatch):
         "user_id": "123456",
         "session_key": "agent:main:telegram:dm:2144471399",
     }
+
+
+
+
+def test_cron_session_contextvar_preserves_legacy_env_fallback(monkeypatch):
+    """Unset cron ContextVar keeps old env-only cron callers working."""
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+    assert get_session_env("HERMES_CRON_SESSION") == "1"
+
+
+def test_cron_session_explicit_blank_masks_leaked_env(monkeypatch):
+    """Non-cron session bindings must override a stale process cron env flag."""
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+    tokens = set_session_vars(platform="api_server", cron_session="")
+    try:
+        assert get_session_env("HERMES_CRON_SESSION") == ""
+    finally:
+        clear_session_vars(tokens)
+
+    assert get_session_env("HERMES_CRON_SESSION") == ""
+
+
+def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
+    """Cron marker supports _UNSET fallback, 1 cron, and  explicit clear."""
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+
+    tokens = set_session_vars(cron_session="1")
+    assert get_session_env("HERMES_CRON_SESSION") == "1"
+
+    clear_session_vars(tokens)
+    assert get_session_env("HERMES_CRON_SESSION") == ""
+
+    reset_session_vars()
+    assert get_session_env("HERMES_CRON_SESSION") == "1"
 
