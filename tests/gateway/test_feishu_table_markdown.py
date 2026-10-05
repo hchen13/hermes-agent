@@ -21,14 +21,9 @@ _adapter = load_plugin_adapter("feishu")
 
 
 def _call_build_outbound_payload(content: str) -> tuple[str, str]:
-    """Invoke ``_build_outbound_payload`` on a bare adapter instance.
-
-    ``_build_outbound_payload`` is a method that only uses module-level
-    helpers (``_MARKDOWN_TABLE_RE``, ``_MARKDOWN_HINT_RE``,
-    ``_build_markdown_post_payload``) and never touches ``self.*``, so a bare
-    object is sufficient.
-    """
-    inst = object.__new__(_adapter.FeishuAdapter)
+    """Exercise the default post format with initialized account settings."""
+    from gateway.config import PlatformConfig
+    inst = _adapter.FeishuAdapter(PlatformConfig())
     return inst._build_outbound_payload(content)
 
 
@@ -85,5 +80,4 @@ def test_markdown_table_uses_post_not_text():
     assert "col A" in joined and "|" in joined, (
         "table text was lost or reformatted when switching from text to post"
     )
-
 

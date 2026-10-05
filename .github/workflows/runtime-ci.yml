@@ -38,22 +38,21 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
 
-      - name: Set up Python 3.11
-        run: uv python install 3.11
+      - name: Set up Python 3.12
+        run: uv python install 3.12
 
       - name: Install dependencies
         run: |
-          uv venv .venv --python 3.11
-          source .venv/bin/activate
-          uv pip install -e ".[all,dev,feishu]"
+          uv sync --frozen --extra dev --extra messaging --extra feishu --python 3.12
 
       - name: Run runtime-focused tests
         run: |
-          source .venv/bin/activate
-          python -m pytest \
+          scripts/run_tests.sh -j 4 \
             tests/gateway/test_platform_reconnect.py \
             tests/gateway/test_platform_reconnect_fd_leak.py \
-            tests/gateway/test_feishu_ws_runtime.py \
+            tests/gateway/test_feishu_ws_multiplex_isolation.py \
+            tests/gateway/test_fork_feishu_accounts.py \
+            tests/gateway/test_fork_feishu_progress.py \
             tests/gateway/test_feishu.py \
             tests/gateway/test_sethome_multi_account.py \
             tests/gateway/test_unauthorized_dm_behavior.py \
@@ -61,11 +60,12 @@ jobs:
             tests/gateway/test_active_session_text_merge.py \
             tests/gateway/test_config.py \
             tests/cron/test_scheduler.py \
-            tests/run_agent/test_compression_feasibility.py \
-            tests/cli/test_fast_command.py \
+            tests/agent/test_compression_feasibility.py \
+            tests/hermes_cli/test_fast_command.py \
             tests/gateway/test_fast_command.py \
-            tests/run_agent/test_provider_parity.py \
-            tests/run_agent/test_run_agent_codex_responses.py \
+            tests/agent/test_provider_parity.py \
+            tests/agent/test_run_agent_codex_responses.py \
+            tests/agent/test_fork_verbosity.py \
             tests/tools/test_feishu_id_tool.py \
             tests/tools/test_send_message_tool.py \
             -q --tb=short

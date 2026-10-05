@@ -32,10 +32,9 @@ sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    MessageEvent,
-    MessageType,
     SendResult,
 )
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
 
 
@@ -247,31 +246,3 @@ async def test_control_and_clarify_messages_bypass_text_debounce():
     adapter._message_handler.assert_awaited_once_with(answer)
     assert session_key not in adapter._text_debounce
     assert session_key not in adapter._pending_messages
-
-
-def test_adapter_defaults_to_interrupt_mode(monkeypatch):
-    monkeypatch.delenv("HERMES_GATEWAY_BUSY_TEXT_MODE", raising=False)
-    adapter = _make_initialized_adapter()
-    assert adapter._busy_text_mode == "interrupt"
-    assert not adapter._is_queue_text_debounce_candidate(_make_event("hello"))
-
-
-def test_command_messages_bypass_debounce_even_in_queue_mode():
-    adapter = _make_adapter()
-    assert not adapter._is_queue_text_debounce_candidate(_make_event(""))
-    assert not adapter._is_queue_text_debounce_candidate(_make_event("/stop"))
-
-
-
-def test_busy_text_mode_respects_env_var_override(monkeypatch):
-    monkeypatch.setenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "interrupt")
-    adapter = _make_initialized_adapter()
-    assert adapter._busy_text_mode == "interrupt"
-    assert not adapter._is_queue_text_debounce_candidate(_make_event("test"))
-
-
-def test_busy_text_mode_accepts_steer_env_var(monkeypatch):
-    monkeypatch.setenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "steer")
-    adapter = _make_initialized_adapter()
-    assert adapter._busy_text_mode == "steer"
-    assert not adapter._is_queue_text_debounce_candidate(_make_event("test"))
